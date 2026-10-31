@@ -6,14 +6,19 @@ import random
 import os
 import torch.fx as fx
 import inspect
-import httpx
+import requests
 
 
-from huggingface_hub import login, set_client_factory
+from huggingface_hub import login, configure_http_backend
 
 
 def disable_hf_brotli():
-    set_client_factory(lambda: httpx.Client(headers={"accept-encoding": "gzip, deflate"}))
+    def create_session():
+        session = requests.Session()
+        session.headers["Accept-Encoding"] = "gzip, deflate"
+        return session
+
+    configure_http_backend(backend_factory=create_session)
 
 
 disable_hf_brotli()
@@ -40,9 +45,9 @@ print(f"Using {device} device")
 # model_name = "mistralai/Mistral-7B-v0.1"
 # model_name = "meta-llama/Meta-Llama-3-8B"
 # model_name = "meta-llama/Llama-3.2-1B"
-# model_name = "Qwen/Qwen2.5-0.5B"
+model_name = "Qwen/Qwen3-4B"
 # model_name = "meta-llama/Llama-3.2-3B-Instruct"
-model_name = "ibm-granite/granite-3.3-2b-instruct"
+# model_name = "ibm-granite/granite-3.3-2b-instruct"
 
 print("Loading model:", model_name)
 

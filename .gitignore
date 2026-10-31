@@ -282,4 +282,5 @@ inspect_evals/plots/
 *.png
 logs/
 .agents
+lm_eval_tasks/
 model_architectures/
