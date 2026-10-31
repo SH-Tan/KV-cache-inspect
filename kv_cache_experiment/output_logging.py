@@ -44,13 +44,20 @@ def write_prompt_scores(task, sample_ids, log_ids, task_dir, case):
         write_json(path, record)
 
 
-class TokenProbabilities:
-    """Keep only ten IDs/probabilities per step on CPU, never full-vocabulary scores."""
+class GenerationStats:
+    """Keep top-ten probabilities and cache-length snapshots on CPU, not KV tensors."""
 
     def __init__(self):
         self.steps = []
+        self.prefill_cache_tokens = None
+        self.final_cache_tokens = None
 
     def record(self, module, inputs, output):
+        # Physical sequence dimension, not a cache's logical position counter.
+        cache_tokens = [layer.keys.shape[-2] for layer in output.past_key_values.layers]
+        if not self.steps:
+            self.prefill_cache_tokens = cache_tokens
+        self.final_cache_tokens = cache_tokens
         logits = output.logits[0, -1].detach().float()
         values, token_ids = torch.topk(logits, min(10, logits.numel()))
         # Equivalent to softmax over the whole vocabulary, not just the top ten.
@@ -75,18 +82,37 @@ class TokenProbabilities:
         return checkpoints
 
 
-def write_score_table(path, task_names, ratios, scores):
-    """Write percentage scores; Avg. is the unweighted mean over all selected tasks."""
+def write_score_table(path, task_names, ratios, scores, *, model_path, press, do_sample, seed):
+    """Write CSV and readable Markdown from the same percentage-score rows."""
     columns = [TASK_LABELS.get(task, task) for task in task_names]
+    rows = []
+    for ratio in ratios:
+        values = [scores.get((ratio, task)) for task in task_names]
+        values = ["" if value is None else 100 * value for value in values]
+        average = sum(values) / len(values) if "" not in values else ""
+        case = "baseline" if ratio == 0 else f"compression_{ratio}"
+        rows.append([case, ratio] + values + [average])
+
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["C.R."] + columns + ["Avg."])
-        for ratio in ratios:
-            values = []
-            for task in task_names:
-                score = scores.get((ratio, task))
-                values.append("" if score is None else 100 * score)
-            average = ""
-            if "" not in values:
-                average = sum(values) / len(values)
-            writer.writerow([ratio] + values + [average])
+        writer.writerow(["Model", "Press", "do_sample", "Seed", "Case", "C.R."] + columns + ["Avg."])
+        for row in rows:
+            writer.writerow([model_path, press, json.dumps(do_sample), seed] + row)
+
+    with path.with_suffix(".md").open("w", encoding="utf-8") as stream:
+        stream.write("# Scores vs. compression / 分数与压缩率\n\n")
+        stream.write(f"Model / 模型: `{model_path}`  \n")
+        stream.write(f"Press / 压缩方法: `{press}`  \n")
+        stream.write(f"Sampling / 随机采样 (`do_sample`): `{json.dumps(do_sample)}`; Seed / 随机种子: `{seed}`\n\n")
+        stream.write("C.R. is the fraction of prefill KV entries removed. `baseline` (0) uses no compression.\n\n")
+        stream.write("C.R. 表示预填充阶段删除的 KV 条目比例；`baseline`（0）表示不压缩。\n\n")
+        headers = ["Case / 条件", "C.R."] + [task.removeprefix("longbench_") for task in task_names] + ["Avg."]
+        stream.write("| " + " | ".join(headers) + " |\n")
+        stream.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
+        for case, ratio, *values in rows:
+            cells = [case, str(ratio)] + ["—" if value == "" else f"{value:.2f}" for value in values]
+            stream.write("| " + " | ".join(cells) + " |\n")
+        stream.write("\nScores are each task's metric × 100, not a shared accuracy metric. Avg. is the unweighted mean across tasks.\n\n")
+        stream.write("各列为对应任务的指标 × 100，并非统一的准确率。Avg. 是各任务分数的算术平均值。\n\n")
+        stream.write("— means pending; Avg. appears when all tasks in that row finish. CSV retains unrounded values.\n\n")
+        stream.write("— 表示尚未完成；同一行的所有任务完成后才显示 Avg.。CSV 保留未四舍五入的数值。\n")

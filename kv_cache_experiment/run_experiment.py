@@ -24,7 +24,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from src.utils.cuda_memory_utils import release_cuda_memory
-from output_logging import TokenProbabilities, write_json, write_prompt_scores, write_score_table
+from output_logging import GenerationStats, write_json, write_prompt_scores, write_score_table
 
 
 def configure_determinism():
@@ -88,14 +88,17 @@ class KVPressLM(HFLM):
                 prompt_dir = Path(self.args.output_dir) / request.task_name / f"prompt_{doc_id}"
                 prompt_dir.mkdir(parents=True, exist_ok=True)
                 self.record = {
+                    "do_sample": self.args.do_sample,
+                    "temperature": self.args.temperature, "top_p": self.args.top_p,
+                    "top_k": self.args.top_k, "seed": self.args.seed,
+                    "model": self.args.model_path, "press": self.args.press,
                     "task": request.task_name, "doc_id": doc_id, "case": self.case,
                     "compression_ratio": self.compression_ratio, "compression_scope": "prefill_only",
-                    "seed": self.args.seed, "reference_answers": request.doc["answers"],
+                    "reference_answers": request.doc["answers"],
                     "probability_definition": "softmax(raw model logits), before temperature/top-p/top-k",
                 }
             answer = super().generate_until([request], disable_tqdm=True)[0]
             if self.record is not None:
-                self.record["scored_output"] = answer
                 write_json(prompt_dir / f"{self.case}.json", self.record)
             answers.append(answer)
             release_cuda_memory()
@@ -104,13 +107,13 @@ class KVPressLM(HFLM):
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         set_seed(self.args.seed)
         prompt_length = context.shape[1]
-        probabilities = TokenProbabilities() if self.record is not None else None
+        stats = GenerationStats() if self.record is not None else None
         compression = self.press(self.model) if self.press is not None else nullcontext()
         with torch.no_grad(), compression:
             # Capture only generation forwards, after the press has initialized.
             hook = (
-                self.model.register_forward_hook(probabilities.record)
-                if probabilities is not None else nullcontext()
+                self.model.register_forward_hook(stats.record)
+                if stats is not None else nullcontext()
             )
             with hook:
                 generated = super()._model_generate(
@@ -121,8 +124,11 @@ class KVPressLM(HFLM):
             generated_ids = generated[0, prompt_length:].tolist()
             self.record["prompt_tokens"] = prompt_length
             self.record["generated_tokens"] = len(generated_ids)
-            self.record["output"] = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            self.record["checkpoints"] = probabilities.checkpoints(generated_ids, self.tokenizer)
+            self.record["kv_cache_tokens"] = {
+                "after_prefill_per_layer": stats.prefill_cache_tokens,
+                "after_generation_per_layer": stats.final_cache_tokens,
+            }
+            self.record["checkpoints"] = stats.checkpoints(generated_ids, self.tokenizer)
         return generated
 
 
@@ -181,7 +187,10 @@ def main():
             )
             write_prompt_scores(task, indices, lm.log_ids, task_dir, case)
             scores[(ratio, task_name)] = results["results"][task_name]["score,none"]
-            write_score_table(output_dir / "scores.csv", args.tasks, args.compression_ratios, scores)
+            write_score_table(
+                output_dir / "scores.csv", args.tasks, args.compression_ratios, scores,
+                model_path=args.model_path, press=args.press, do_sample=args.do_sample, seed=args.seed,
+            )
             write_json(task_dir / f"{case}_results.json", results)
             print(f"{task_name} {case}: {results['results'][task_name]}")
             del results
