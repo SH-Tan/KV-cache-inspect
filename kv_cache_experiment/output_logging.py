@@ -1,4 +1,4 @@
-"""Compact token-probability logs and compression-rate score tables."""
+"""Readable prompt logs and compression-rate score tables."""
 
 import csv
 import json
@@ -40,8 +40,27 @@ def write_prompt_scores(task, sample_ids, log_ids, task_dir, case):
             continue
         path = task_dir / f"prompt_{doc_id}" / f"{case}.json"
         record = json.loads(path.read_text(encoding="utf-8"))
-        record["scores"] = task.process_results(request.doc, [request.filtered_resps["none"]])
+        answer = request.filtered_resps["none"]
+        record["final_answer"] = answer
+        if case != "baseline":
+            baseline_path = path.with_name("baseline.json")
+            if baseline_path.exists():
+                record["baseline_answer"] = json.loads(
+                    baseline_path.read_text(encoding="utf-8")
+                )["final_answer"]
+        record["scores"] = task.process_results(request.doc, [answer])
         write_json(path, record)
+
+
+def compact_layer_lengths(lengths):
+    """Use one count when all layers match; otherwise preserve layer order."""
+    return lengths[0] if len(set(lengths)) == 1 else lengths
+
+
+def write_task_results(path, results, task_name):
+    """Keep task metrics and evaluated counts, without lm-eval's repeated metadata."""
+    write_json(path, {"metrics": results["results"][task_name],
+                      "n_samples": results["n-samples"][task_name]})
 
 
 class GenerationStats:
@@ -49,15 +68,13 @@ class GenerationStats:
 
     def __init__(self):
         self.steps = []
-        self.prefill_cache_tokens = None
-        self.final_cache_tokens = None
+        self.cache_tokens = []
 
     def record(self, module, inputs, output):
         # Physical sequence dimension, not a cache's logical position counter.
-        cache_tokens = [layer.keys.shape[-2] for layer in output.past_key_values.layers]
-        if not self.steps:
-            self.prefill_cache_tokens = cache_tokens
-        self.final_cache_tokens = cache_tokens
+        self.cache_tokens.append(compact_layer_lengths(
+            [layer.keys.shape[-2] for layer in output.past_key_values.layers]
+        ))
         logits = output.logits[0, -1].detach().float()
         values, token_ids = torch.topk(logits, min(10, logits.numel()))
         # Equivalent to softmax over the whole vocabulary, not just the top ten.
@@ -69,13 +86,17 @@ class GenerationStats:
         total_steps = len(generated_ids)
         for percent in (10, 20, 50, 80, 90, 100):
             step = (percent * total_steps + 99) // 100
+            if checkpoints and checkpoints[-1]["step"] == step:
+                checkpoints[-1]["percents"].append(percent)
+                continue
             token_ids, probabilities = self.steps[step - 1]
             top_tokens = []
             for token_id, probability in zip(token_ids, probabilities):
                 top_tokens.append({"token_id": token_id, "token": tokenizer.decode([token_id]),
                                    "probability": probability})
             generated_id = generated_ids[step - 1]
-            checkpoints.append({"percent": percent, "step": step,
+            checkpoints.append({"percents": [percent], "step": step,
+                                "kv_cache_tokens": self.cache_tokens[step - 1],
                                 "generated_token_id": generated_id,
                                 "generated_token": tokenizer.decode([generated_id]),
                                 "top_10": top_tokens})

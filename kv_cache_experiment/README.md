@@ -14,6 +14,10 @@ Set experiment values in `run.sh`, or override them with environment variables. 
 
 实验参数在 `run.sh` 中设置，也可以通过环境变量覆盖。README 只说明参数含义，每次运行实际使用的值记录在 `settings.json` 中。通过 `PYTHON_BIN` 选择已安装 `kvpress`、`transformers` 和 `lm_eval[longbench]` 的环境。`LOCAL_FILES_ONLY` 控制是否允许下载。
 
+Use `LOCAL_FILES_ONLY=0` to allow downloading missing model or dataset files; use `1` only when both are cached. The launcher sets the Hugging Face offline flags to match this option, including flags inherited from the shell.
+
+`LOCAL_FILES_ONLY=0` 允许下载缺失的模型或数据集文件；只有两者都已缓存时才使用 `1`。启动脚本会根据此参数统一设置 Hugging Face 的离线开关，覆盖 shell 中继承的旧值。
+
 ## Evaluation size and logging / 评测数量与日志数量
 
 **`TASK_COUNTS` determines how many prompts are evaluated. `LIMIT` determines how many of those prompts receive detailed logs.** Scores always use every evaluated prompt.
@@ -95,7 +99,7 @@ logs/kv_cache_experiment/<PRESS>/limit-<LIMIT>/<timestamp>/
   longbench_qasper/
     sample_ids.json             # Evaluated document IDs / 评测样本 ID
     log_ids.json                # Detailed-log document IDs / 详细日志样本 ID
-    baseline_results.json       # lm-eval aggregate results / lm-eval 汇总结果
+    baseline_results.json       # Task metrics + sample counts / 任务指标与样本数量
     compression_<rate>_results.json
     prompt_<original_dataset_id>/
       baseline.json            # Full-KV statistics / 不压缩时的统计
@@ -105,39 +109,44 @@ logs/kv_cache_experiment/<PRESS>/limit-<LIMIT>/<timestamp>/
 
 ### Lengths and softmax / 长度与 softmax
 
-Each prompt JSON starts with `do_sample`, followed by temperature, top-p, top-k, seed, model, and compression method. `false` means greedy decoding; `true` means sampling. The stored sampling parameters are the configured values and are inactive during greedy decoding.
+Shared model, sampling, seed, and compression settings are stored once in the run's `settings.json`. Prompt files contain only prompt-specific data. `baseline_results.json` and `compression_<rate>_results.json` contain aggregate task `metrics` and `n_samples` (original dataset size and effective evaluation count), rather than lm-eval's full configuration and hardware dump. Scores use all evaluated prompts, not just the detailed logs.
 
-每条输入的 JSON 日志以 `do_sample` 开头，随后记录温度、top-p、top-k、随机种子、模型和压缩方法。`false` 表示贪心解码，`true` 表示随机采样。日志中的采样参数是配置值，在贪心解码时不生效。
+模型、采样、随机种子和压缩设置只在本次运行的 `settings.json` 中保存一次。每条输入的日志只包含该输入的数据。`baseline_results.json` 和 `compression_<rate>_results.json` 只保存任务汇总指标 `metrics` 和样本数量 `n_samples`（原始数据集大小及实际评测数量），不再重复 lm-eval 的配置和硬件信息。分数使用全部评测输入，而不只是详细日志样本。
 
-Full generated text and the reasoning path are not written to disk. The complete response is still used for evaluation. Here, “reasoning length” means the total number of generated tokens, including the answer; it is recorded as `generated_tokens`.
+`full_generated_text` preserves the entire emitted response, including any generated reasoning and special/stop tokens. `final_answer` is the exact filtered response passed to the task's scoring function, after lm-eval's decoding and stop handling. It is not a separately guessed answer extracted from the reasoning. If the model emits no reasoning, only its generated answer is available. Compressed logs also include the baseline's scored response as `baseline_answer` when available.
 
-日志不保存完整生成文本或 reasoning path，但评测仍使用完整生成结果。这里的“reasoning 长度”指整段生成的 token 数，包含答案，记录在 `generated_tokens` 字段中。
+`full_generated_text` 保存完整生成内容，包括模型实际生成的推理过程及特殊/停止 token。`final_answer` 是经过 lm-eval 解码、停止处理和过滤后，实际传给任务评分函数的原文，并非另外从推理中猜测提取的答案。模型未生成推理时，只能记录其生成的回答。压缩日志还会在基线结果可用时，用 `baseline_answer` 保存基线的评分回答。
 
-Compare `baseline.json` and `compression_<rate>.json` in the same prompt directory. Both contain:
+Compare `baseline.json` and `compression_<rate>.json` in the same prompt directory. Their fields are:
 
-对比同一输入目录中的 `baseline.json` 和 `compression_<rate>.json`，即可查看压缩前后的结果。两者都包含：
+对比同一输入目录中的 `baseline.json` 和 `compression_<rate>.json`，即可查看压缩前后的结果。字段说明如下：
 
 | Field / 字段 | Meaning / 含义 |
 | --- | --- |
+| `full_prompt` | Complete prompt before truncation / 截断前的完整输入 |
+| `full_prompt_tokens` | Input token count before truncation, using generation's special-token handling / 使用与生成一致的特殊 token 处理方式，统计截断前输入的 token 数 |
 | `reference_answers` | Dataset reference answers / 数据集参考答案 |
+| `baseline_answer` | Baseline response passed to scoring, in compressed logs when available / 压缩日志中可用的基线评分回答 |
+| `full_generated_text` | Entire generated text, including emitted reasoning and answer / 完整生成内容，包含实际生成的推理和答案 |
+| `final_answer` | Exact filtered response passed to scoring / 实际传给评分函数的过滤后回答 |
 | `scores` | This prompt's task metrics / 该条输入的任务分数 |
 | `prompt_tokens` | Input tokens actually used after truncation / 截断后实际使用的输入 token 数 |
 | `generated_tokens` | Total generated tokens, including the answer / 整段生成的 token 数，包含答案 |
-| `kv_cache_tokens.after_prefill_per_layer` | Actual retained KV length after prefill compression, by layer / prefill 压缩后各层实际保留的 KV 长度 |
-| `kv_cache_tokens.after_generation_per_layer` | Actual KV length at the final generation forward, by layer / 最后一次生成 forward 后各层实际 KV 长度 |
-| `checkpoints` | Top-10 tokens and their probabilities, plus the generated token / 概率最高的 10 个 token、各自概率，以及实际生成的 token |
+| `kv_cache_tokens.after_prefill` | Actual retained KV length after prefill compression / prefill 压缩后实际保留的 KV 长度 |
+| `kv_cache_tokens.after_generation` | Actual KV length at the final generation forward / 最后一次生成 forward 后的实际 KV 长度 |
+| `checkpoints` | Percentages, step, measured KV length, generated token, and top-10 probabilities / 百分比、位置、实测 KV 长度、生成 token 和 top-10 概率 |
 
-All lengths are token counts. Cache-length arrays are ordered by layer, starting at layer 0; they describe stored sequence positions, not bytes or a sum across heads. The same fields are recorded for the full-KV `baseline` and each compression rate. The final generated token has not yet been fed back into the model, so it is normally absent from the final cache. With ordinary dynamic caches, final KV length is the retained prefill length plus `generated_tokens - 1`.
+All lengths are token counts. Each KV length is a single integer when all layers match; otherwise it is an array ordered from layer 0. These lengths describe stored sequence positions, not bytes or a sum across heads. The same fields are recorded for the full-KV `baseline` and each compression rate. Each checkpoint's `kv_cache_tokens` is measured at the forward that predicts that step's token. That token has not yet been fed back into the model, so it is normally absent from the cache. With ordinary dynamic caches, final KV length is the retained prefill length plus `generated_tokens - 1`.
 
-所有长度均以 token 为单位。KV 长度数组按层排列，从第 0 层开始；它表示缓存中的序列位置数，不是字节数，也不是所有 head 的长度之和。full-KV 的 `baseline` 和各压缩率都记录相同字段。最后一个生成的 token 尚未再次输入模型，因此通常还没有对应的 KV。对于普通动态缓存，结束时的 KV 长度等于 prefill 保留长度加上 `generated_tokens - 1`。
+所有长度均以 token 为单位。各层 KV 长度相同时只保存一个整数，否则按层保存数组（从第 0 层开始）；它表示缓存中的序列位置数，不是字节数，也不是所有 head 的长度之和。full-KV 的 `baseline` 和各压缩率都记录相同字段。检查点的 `kv_cache_tokens` 是预测该位置 token 的 forward 时实测的长度。该 token 尚未再次输入模型，因此通常还没有对应的 KV。对于普通动态缓存，结束时的 KV 长度等于 prefill 保留长度加上 `generated_tokens - 1`。
 
 Checkpoint probabilities are **softmax over the entire vocabulary**, using raw model logits before temperature or top-p/top-k filtering. The ten displayed probabilities are not renormalized. With sampling, the generated token may be outside the displayed top ten.
 
 检查点的概率是对原始 logits 在**整个词表上计算 softmax** 的结果，尚未经过温度或 top-p/top-k 处理。显示的 10 个概率不会重新归一化。开启采样后，实际生成的 token 可能不在这 10 个之中。
 
-Checkpoints are at 10%, 20%, 50%, 80%, 90%, and 100% of each answer's generated length. For `N` generated tokens, the step is `ceil(percent × N / 100)`, counting from 1. Counts include generated EOS/stop tokens. Short answers can repeat a checkpoint step. If compression changes the answer length, the same percentage can refer to different token positions.
+Checkpoints are at 10%, 20%, 50%, 80%, 90%, and 100% of each answer's generated length. For `N` generated tokens, the step is `ceil(percent × N / 100)`, counting from 1. Counts include generated EOS/stop tokens. Percentages that land on the same step share one checkpoint with a `percents` list, avoiding repeated top-10 data. If compression changes the answer length, the same percentage can refer to different token positions.
 
-检查点位于每个答案生成长度的 10%、20%、50%、80%、90% 和 100%。生成 `N` 个 token 时，位置为 `ceil(percent × N / 100)`，从 1 开始计数，包含已生成的 EOS 或停止 token。短答案可能有多个百分比对应同一位置。压缩前后答案长度不同时，相同百分比不一定对应相同的 token 位置。
+检查点位于每个答案生成长度的 10%、20%、50%、80%、90% 和 100%。生成 `N` 个 token 时，位置为 `ceil(percent × N / 100)`，从 1 开始计数，包含已生成的 EOS 或停止 token。同一位置的多个百分比合并到一个检查点的 `percents` 列表中，避免重复 top-10 数据。压缩前后答案长度不同时，相同百分比不一定对应相同的 token 位置。
 
 ### Scores versus compression / 分数与压缩率
 
@@ -167,6 +176,6 @@ Tables update after each task/rate finishes. Pending cells are blank in CSV and 
 
 **每次生成答案前都会重置随机种子。** 在输入、参数、硬件和软件环境一致时，重复运行应能复现结果。但相同种子并不强制压缩前后生成相同答案，因为压缩可能改变 token 概率。程序启用 PyTorch 确定性运算，并关闭 TF32 和 cuDNN 自动调优。
 
-**Detailed logging is limited to the selected prompts.** The logger keeps the top ten token IDs and probabilities per generated step on CPU, then writes the six checkpoints. It also keeps the prefill and final cache lengths as integer lists. It does not retain full-vocabulary probability histories or KV tensors. Each generation starts with a fresh cache.
+**Detailed logging is limited to the selected prompts.** The logger keeps the top ten token IDs, probabilities, and compact KV lengths per generated step on CPU, then writes the selected checkpoints and full text. It does not retain full-vocabulary probability histories or KV tensors. Each generation starts with a fresh cache. These fields apply to new runs; old logs cannot recover text that was never saved.
 
-**只有选中的输入会记录详细日志。** 日志模块在 CPU 上保留每步概率最高的 10 个 token ID 及其概率，最后写出六个检查点。prefill 和生成结束时的缓存长度只保存为整数列表，不保留整个词表的概率历史或 KV 张量。每次生成都使用新的缓存。
+**只有选中的输入会记录详细日志。** 日志模块在 CPU 上保留每步概率最高的 10 个 token ID、概率和精简的 KV 长度，最后写出选定的检查点及完整文本，不保留整个词表的概率历史或 KV 张量。每次生成都使用新的缓存。上述字段适用于新运行；旧日志无法恢复从未保存的文本。

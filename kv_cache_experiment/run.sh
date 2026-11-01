@@ -17,7 +17,7 @@ PRESS="${PRESS:-StreamingLLMPress}"
 COMPRESSION_RATIOS="${COMPRESSION_RATIOS:-${COMPRESSION_RATIO:-0.1,0.2,0.5,0.8,0.9}}"
 PRESS_KWARGS=${PRESS_KWARGS:-'{}'}
 # LIMIT controls detailed prompt logs per task, not evaluation size.
-LIMIT="${LIMIT:-5}"
+LIMIT="${LIMIT:-20}"
 TASK_COUNTS=${TASK_COUNTS:-'{
   "longbench_narrativeqa": 200,
   "longbench_qasper": 200,
@@ -45,23 +45,23 @@ TASKS="${TASKS:-longbench_qasper,longbench_hotpotqa,longbench_gov_report,longben
 # FSL: longbench_triviaqa,longbench_samsum
 # Synth.: longbench_passage_retrieval_en
 # Code: longbench_repobench-p
-MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-20480}"
+MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-102400}"
 SEED="${SEED:-29}"
 DO_SAMPLE="${DO_SAMPLE:-0}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.9}"
 TOP_K="${TOP_K:-0}"
-LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-1}"
+LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/logs/kv_cache_experiment/$PRESS/limit-$LIMIT/$(date +%Y%m%d_%H%M%S)}"
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONHASHSEED="$SEED"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export HF_HUB_OFFLINE="$LOCAL_FILES_ONLY" TRANSFORMERS_OFFLINE="$LOCAL_FILES_ONLY" HF_DATASETS_OFFLINE="$LOCAL_FILES_ONLY"
 flags=()
 if [ "$LOCAL_FILES_ONLY" = 1 ]; then
   flags+=(--local-files-only)
-  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 fi
 if [ "$TRUST_REMOTE_CODE" = 1 ]; then
   flags+=(--trust-remote-code)

@@ -24,7 +24,9 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from src.utils.cuda_memory_utils import release_cuda_memory
-from output_logging import GenerationStats, write_json, write_prompt_scores, write_score_table
+from output_logging import (
+    GenerationStats, write_json, write_prompt_scores, write_score_table, write_task_results,
+)
 
 
 def configure_determinism():
@@ -88,18 +90,16 @@ class KVPressLM(HFLM):
                 prompt_dir = Path(self.args.output_dir) / request.task_name / f"prompt_{doc_id}"
                 prompt_dir.mkdir(parents=True, exist_ok=True)
                 self.record = {
-                    "do_sample": self.args.do_sample,
-                    "temperature": self.args.temperature, "top_p": self.args.top_p,
-                    "top_k": self.args.top_k, "seed": self.args.seed,
-                    "model": self.args.model_path, "press": self.args.press,
                     "task": request.task_name, "doc_id": doc_id, "case": self.case,
-                    "compression_ratio": self.compression_ratio, "compression_scope": "prefill_only",
+                    "compression_ratio": self.compression_ratio,
+                    "full_prompt": request.args[0],
+                    "full_prompt_tokens": self.tok_batch_encode([request.args[0]])[0].shape[1],
                     "reference_answers": request.doc["answers"],
-                    "probability_definition": "softmax(raw model logits), before temperature/top-p/top-k",
                 }
             answer = super().generate_until([request], disable_tqdm=True)[0]
             if self.record is not None:
                 write_json(prompt_dir / f"{self.case}.json", self.record)
+                self.record = None
             answers.append(answer)
             release_cuda_memory()
         return answers
@@ -123,10 +123,14 @@ class KVPressLM(HFLM):
         if self.record is not None:
             generated_ids = generated[0, prompt_length:].tolist()
             self.record["prompt_tokens"] = prompt_length
+            # Preserve the complete emitted text, including reasoning/stop markers.
+            self.record["full_generated_text"] = self.tokenizer.decode(
+                generated_ids, skip_special_tokens=False,
+            )
             self.record["generated_tokens"] = len(generated_ids)
             self.record["kv_cache_tokens"] = {
-                "after_prefill_per_layer": stats.prefill_cache_tokens,
-                "after_generation_per_layer": stats.final_cache_tokens,
+                "after_prefill": stats.cache_tokens[0],
+                "after_generation": stats.cache_tokens[-1],
             }
             self.record["checkpoints"] = stats.checkpoints(generated_ids, self.tokenizer)
         return generated
@@ -191,7 +195,7 @@ def main():
                 output_dir / "scores.csv", args.tasks, args.compression_ratios, scores,
                 model_path=args.model_path, press=args.press, do_sample=args.do_sample, seed=args.seed,
             )
-            write_json(task_dir / f"{case}_results.json", results)
+            write_task_results(task_dir / f"{case}_results.json", results, task_name)
             print(f"{task_name} {case}: {results['results'][task_name]}")
             del results
             release_cuda_memory()
