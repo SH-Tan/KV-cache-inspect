@@ -1,7 +1,0 @@
-[package]
-edition = "2021"
-name = "simple-cipher"
-version = "0.0.0"
-
-[dependencies]
-rand = "0.8"

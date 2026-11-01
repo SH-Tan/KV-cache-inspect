@@ -1,4 +1,0 @@
-[package]
-edition = "2021"
-name = "accumulate"
-version = "0.0.0"
