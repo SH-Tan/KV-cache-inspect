@@ -23,7 +23,6 @@ def _from_shared_numpy(meta):
     return shm, arr
 
 
-
 def _load_worker_seq_distribution(seq_idx, seq_metas, shm_map, cache_map):
     if seq_metas is None:
         return None
@@ -33,10 +32,9 @@ def _load_worker_seq_distribution(seq_idx, seq_metas, shm_map, cache_map):
     if cached is not None:
         return cached
 
-    if (type(seq_metas) is list):
-        shm, arr = _from_shared_numpy(seq_metas[seq_idx])
-        shm_map[seq_idx] = shm
-        cache_map[seq_idx] = arr
+    shm, arr = _from_shared_numpy(seq_metas[seq_idx])
+    shm_map[seq_idx] = shm
+    cache_map[seq_idx] = arr
     return arr
 
 

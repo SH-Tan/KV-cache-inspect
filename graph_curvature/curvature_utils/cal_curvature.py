@@ -1359,7 +1359,7 @@ def compute_op_curvature(
     base_prev_in_tensor = graph_data["prev_in"]
     residual_names = graph_data.get("residual_names", [])
     prev_node_tensor = base_prev_in_tensor
-    if residual_names and short_name not in ["o_proj"]:
+    if residual_names and short_name != "o_proj":
         prev_node_tensor = _append_residual_prev_nodes(
             operations,
             base_prev_in_tensor,
@@ -1371,7 +1371,7 @@ def compute_op_curvature(
         else None
     )
 
-    if (short_name not in ["o_proj"]) and base_prev_in_tensor is not None:
+    if short_name != "o_proj" and base_prev_in_tensor is not None:
         prev_in_distribution = _build_node_distribution(
             base_prev_in_tensor,
             graph_data["prev_in_name"],
@@ -1384,7 +1384,7 @@ def compute_op_curvature(
             metric_prev_in_distribution = prev_in_distribution
 
     # if is q, k, v, the next is A or attention out
-    if (short_name in {"q_proj", "k_proj"} or short_name not in ["v_proj"]) and graph_data["next_out"] is not None:
+    if short_name != "v_proj" and graph_data["next_out"] is not None:
         if short_name in {"q_proj", "k_proj"}:
             next_out_distribution = _build_qk_out_node_distribution(
                 short_name,
@@ -1497,11 +1497,6 @@ def compute_op_curvature(
             value_map = _build_vproj_to_att_out_value_map(
                 graph_data["next_out"], out_dim, seq_len, head_dim, repeat
             )
-
-            # # node distribution for all seq w/ mask
-            # precomputed_next_dists = _precompute_vproj_next_distributions(
-            #     value_map, seq_len, repeat, graph_data["next_out_name"], alpha
-            # )
 
             # node distribution for all seq w/o mask
             precomputed_next_dists = _precompute_vproj_next_distributions(

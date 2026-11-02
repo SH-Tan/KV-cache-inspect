@@ -1,9 +1,11 @@
 """Compact token-probability logs and compression-rate score tables."""
 
 import csv
+from contextlib import contextmanager
 import json
 
 import torch
+from kvpress.utils import compute_n_kept
 
 
 TASK_LABELS = {
@@ -30,6 +32,29 @@ def write_json(path, data):
     with path.open("w", encoding="utf-8") as stream:
         json.dump(data, stream, indent=2, ensure_ascii=False, default=str)
         stream.write("\n")
+
+
+@contextmanager
+def record_compressed_prompt(press, context, tokenizer, record):
+    """Decode retained positions from layer 0 / KV head 0, in prompt order."""
+    score = press.score
+
+    def capture_score(module, hidden_states, keys, values, attentions, kwargs):
+        scores = score(module, hidden_states, keys, values, attentions, kwargs)
+        if module.layer_idx == 0:
+            n_kept = compute_n_kept(keys.shape[2], press.compression_ratio)
+            # Match ScorerPress's selection, including its handling of tied scores.
+            positions = scores.topk(n_kept, dim=-1).indices[0, 0].sort().values
+            token_ids = context[0].index_select(0, positions.to(context.device)).tolist()
+            record["compressed_prompt"] = tokenizer.decode(token_ids)
+            record["compressed_prompt_source"] = {"layer": 0, "kv_head": 0, "order": "original"}
+        return scores
+
+    press.score = capture_score
+    try:
+        yield
+    finally:
+        del press.score
 
 
 def write_prompt_scores(task, sample_ids, log_ids, task_dir, case):
@@ -67,7 +92,7 @@ class GenerationStats:
     def checkpoints(self, generated_ids, tokenizer):
         checkpoints = []
         total_steps = len(generated_ids)
-        for percent in (10, 20, 50, 80, 90, 100):
+        for percent in (20, 50, 70, 90, 100):
             step = (percent * total_steps + 99) // 100
             token_ids, probabilities = self.steps[step - 1]
             top_tokens = []

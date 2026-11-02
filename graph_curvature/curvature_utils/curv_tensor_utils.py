@@ -116,7 +116,7 @@ def build_layer_cache(model, operations, layer_id, cache=None, device="cuda", re
             if dist_matrix is None:
                 continue
         else:
-            dist_matrix = _operation_distance_matrix_torch(model, operations, name, layer_id, device)
+            dist_matrix = _operation_distance_matrix_torch(model, name, layer_id, device)
         cache[f"{name}__dist"] = dist_matrix.cpu().contiguous()
         del dist_matrix
         if str(device).startswith("cuda") and torch.cuda.is_available():

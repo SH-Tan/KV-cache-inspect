@@ -1,5 +1,6 @@
-import torch
 import math
+
+import torch
 
 
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
@@ -31,7 +32,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
 
     attn_weight = attn_weight + attn_bias
 
-    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
 
     return attn_weight @ value, attn_weight
@@ -110,7 +111,12 @@ def _store_operation(op_bank, name, node, dtype=None):
 
 
 def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_dtype=None):
-    """Collect one full-attention decoder layer; captured tensors stay on CPU."""
+    """Return next hidden states, CPU operation values, and attention dimensions.
+
+    Operation values have shape [batch, sequence, features], except attention
+    probabilities A: [batch, query_heads, sequence, sequence]. gate_proj stores
+    the activated gate values. The returned hidden states stay on x.device.
+    """
     if getattr(layer.self_attn, "sliding_window", None) is not None:
         raise NotImplementedError("The curvature collector supports full attention, not sliding-window attention")
     operations = {}
@@ -119,13 +125,9 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_
         x_in = x
         x_norm = layer.input_layernorm(x_in)
 
-        # ---- store shared layer input ----
+        # Attention inputs and projections.
         _store_operation(operations, "layer_input", x_norm, operation_dtype)
-
-        if not hasattr(layer, "_cached_dims"):
-            layer._cached_dims = _resolve_attention_dims(layer, model)
-
-        num_heads, num_kv_heads, num_kv_groups, head_dim = layer._cached_dims
+        num_heads, num_kv_heads, num_kv_groups, head_dim = _resolve_attention_dims(layer, model)
 
         q_linear = layer.self_attn.q_proj(x_norm)
         k_linear = layer.self_attn.k_proj(x_norm)
@@ -139,7 +141,7 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_
             q = layer.self_attn.q_norm(q)
             k = layer.self_attn.k_norm(k)
 
-        # ---- RoPE ----
+        # Apply positional rotation before collecting Q/K values.
         if position_ids is not None:
             cos, sin = model.model.rotary_emb(x_norm, position_ids)
             q, k = _apply_rotary_pos_emb(q, k, cos, sin)
@@ -149,6 +151,7 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_
         _store_operation(operations, "q_proj", _merge_heads(q), operation_dtype)
         _store_operation(operations, "k_proj", _merge_heads(k), operation_dtype)
         _store_operation(operations, "v_proj", v_linear, operation_dtype)
+        del q_linear, k_linear, v_linear, x_norm
 
         k = _repeat_kv(k, num_kv_groups)
         v = _repeat_kv(v, num_kv_groups)
@@ -165,22 +168,21 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_
 
         attn_context = _merge_heads(attn_output)
 
-        # ---- store Attention weight and out ----
-        A = torch.where(torch.isinf(A), torch.zeros_like(A), A)
         _store_operation(operations, "A", A, operation_dtype)
         _store_operation(operations, "Att_out", attn_context, operation_dtype)
+        del q, k, v, A, attn_output
 
-        # ===== O PROJ =====
+        # Attention output and residual connection.
         o = layer.self_attn.o_proj(attn_context)
         residual_multiplier = getattr(layer, "residual_multiplier", 1.0)
         x_res1 = x_in + o * residual_multiplier
         x_norm2 = layer.post_attention_layernorm(x_res1)
 
-        # ---- attention output ----
         _store_operation(operations, "o_proj", o, operation_dtype)
         _store_operation(operations, "x_norm2", x_norm2, operation_dtype)
+        del attn_context, o
 
-        # ===== MLP =====
+        # Gated MLP and residual connection.
         gate = layer.mlp.gate_proj(x_norm2)
         up = layer.mlp.up_proj(x_norm2)
         act = layer.mlp.act_fn(gate)
@@ -192,15 +194,7 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_
         _store_operation(operations, "gate_proj", act, operation_dtype)
         _store_operation(operations, "up_proj", up, operation_dtype)
         _store_operation(operations, "gate_up_out", mlp_hidden, operation_dtype)
-
-
         _store_operation(operations, "down_proj", down, operation_dtype)
-
-        # ---- cleanup (GPU memory critical) ----
-        del q, k, v, A, attn_output
-        del q_linear, k_linear, v_linear
-        del attn_context, o, x_res1, x_norm2
-        del gate, up, act, mlp_hidden, down
 
     return x_out, operations, num_heads, num_kv_heads, num_kv_groups, head_dim
 

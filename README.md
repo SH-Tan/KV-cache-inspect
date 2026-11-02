@@ -1,10 +1,17 @@
 # KV-cache-inspect
 
-Two standalone experiment folders:
+Tools for studying language-model behavior through KV-cache compression and graph curvature.
 
-- [kv_cache_experiment](kv_cache_experiment/README.md): existing KV-cache compression experiments.
-- [graph_curvature](graph_curvature/README.md): LLM activation extraction, graph construction, and curvature calculation copied from `../LLM-pruning-with-graph-curvature`.
+- [KV-cache experiments](kv_cache_experiment/README.md) compare model performance with and without cache compression.
+- [Graph-curvature experiments](graph_curvature/README.md) collect model activations and calculate curvature over an operation graph.
 
-Each experiment has its own `run.sh`, `run_experiment.py`, and README. Downloaded models stay in `llm_weights/`; run outputs go to `logs/`.
+## Getting started
 
-The KV experiment folder is unchanged. `src/utils/cuda_memory_utils.py` and its package initializer remain because the existing KV runner imports that helper. Legacy evaluation code and scripts have been removed.
+1. Choose an experiment and install the dependencies listed in its README.
+2. Configure its `run.sh` for your Python environment, model, dataset, available hardware, and output location.
+3. Make the model and dataset available through local caches or enable downloads in the launcher settings.
+4. Run the launcher from the repository root.
+
+Settings can be edited in the launcher or overridden through environment variables. Use `PYTHON_BIN` to select your Python interpreter and `MODEL_PATH` to select a model identifier or local model directory. Check the launcher for current options and defaults.
+
+Start with a small workload, inspect the results, and increase the experiment size to suit your CPU and GPU memory. Keep input selection and evaluation settings consistent when comparing runs.

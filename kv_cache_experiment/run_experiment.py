@@ -24,7 +24,9 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from src.utils.cuda_memory_utils import release_cuda_memory
-from output_logging import GenerationStats, write_json, write_prompt_scores, write_score_table
+from output_logging import (
+    GenerationStats, record_compressed_prompt, write_json, write_prompt_scores, write_score_table,
+)
 
 
 def configure_determinism():
@@ -109,7 +111,11 @@ class KVPressLM(HFLM):
         prompt_length = context.shape[1]
         stats = GenerationStats() if self.record is not None else None
         compression = self.press(self.model) if self.press is not None else nullcontext()
-        with torch.no_grad(), compression:
+        prompt_logging = (
+            record_compressed_prompt(self.press, context, self.tokenizer, self.record)
+            if self.press is not None and self.record is not None else nullcontext()
+        )
+        with torch.no_grad(), compression, prompt_logging:
             # Capture only generation forwards, after the press has initialized.
             hook = (
                 self.model.register_forward_hook(stats.record)
@@ -144,13 +150,16 @@ def main():
         raise ValueError("This experiment requires the BasePress prefill-only hook, e.g. SnapKVPress/KnormPress")
     load_kwargs = dict(cache_dir=args.cache_dir, local_files_only=args.local_files_only,
                        trust_remote_code=args.trust_remote_code)
+    
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, **load_kwargs)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, dtype=args.dtype, device_map=args.device_map,
         attn_implementation=args.attn_implementation, low_cpu_mem_usage=True, **load_kwargs,
     ).eval()
+    
     if args.max_context_length > model.config.max_position_embeddings:
         raise ValueError("MAX_CONTEXT_LENGTH exceeds model max_position_embeddings")
+    
     lm = KVPressLM(args, model, tokenizer)
     manager = TaskManager()
     generation_kwargs = dict(do_sample=args.do_sample, temperature=args.temperature,
@@ -170,6 +179,7 @@ def main():
         task_dir.mkdir(parents=True, exist_ok=True)
         write_json(task_dir / "sample_ids.json", indices)
         write_json(task_dir / "log_ids.json", sorted(lm.log_ids))
+        
         for ratio in args.compression_ratios:
             case = "baseline"
             lm.press = None
@@ -178,6 +188,7 @@ def main():
                 lm.press = press_class(compression_ratio=ratio, **args.press_kwargs)
             lm.case = case
             lm.compression_ratio = ratio
+            
             results = simple_evaluate(
                 model=lm, tasks=[task], task_manager=manager, num_fewshot=0, batch_size=1,
                 samples={task_name: indices}, gen_kwargs=generation_kwargs,
