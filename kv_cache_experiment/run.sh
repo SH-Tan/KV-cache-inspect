@@ -13,7 +13,7 @@ GPU="${GPU:-0}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 DTYPE="${DTYPE:-auto}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
-PRESS="${PRESS:-StreamingLLMPress}" #SnapKVPress
+PRESS="${PRESS:-PyramidKVPress}" #SnapKVPress  StreamingLLMPress PyramidKVPress 
 COMPRESSION_RATIOS="${COMPRESSION_RATIOS:-${COMPRESSION_RATIO:-0.3,0.5,0.7,0.9}}"
 PRESS_KWARGS=${PRESS_KWARGS:-'{}'}
 # LIMIT controls detailed prompt logs per task, not evaluation size.
@@ -25,7 +25,7 @@ TASK_COUNTS=${TASK_COUNTS:-'{
   "longbench_hotpotqa": 100,
   "longbench_2wikimqa": 200,
   "longbench_musique": 200,
-  "longbench_gov_report": 200,
+  "longbench_gov_report": 50,
   "longbench_qmsum": 200,
   "longbench_multi_news": 100,
   "longbench_trec": 100,
@@ -37,7 +37,7 @@ TASK_COUNTS=${TASK_COUNTS:-'{
   "longbench_repobench-p": 500
 }'}
 # One task per category: SD-QA, MD-QA, Summ., FSL, Synth., Code.
-TASKS="${TASKS:-longbench_qasper,longbench_hotpotqa,longbench_multi_news,longbench_trec,longbench_passage_retrieval_en,longbench_lcc}"
+TASKS="${TASKS:-longbench_qasper,longbench_hotpotqa,longbench_gov_report,longbench_trec,longbench_passage_retrieval_en,longbench_lcc}"
 # Other tasks available through TASKS:
 # SD-QA: longbench_narrativeqa,longbench_multifieldqa_en
 # MD-QA: longbench_2wikimqa,longbench_musique
@@ -46,7 +46,7 @@ TASKS="${TASKS:-longbench_qasper,longbench_hotpotqa,longbench_multi_news,longben
 # Synth.: longbench_passage_retrieval_en
 # Code: longbench_repobench-p
 MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-20480}"
-SEED="${SEED:-29}"
+SEED="${SEED:-19}"
 DO_SAMPLE="${DO_SAMPLE:-0}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.9}"

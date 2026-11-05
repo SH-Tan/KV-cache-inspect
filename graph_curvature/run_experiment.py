@@ -43,10 +43,10 @@ def parse_args():
     parser.add_argument("--compute-device", default="cpu")
     parser.add_argument("--curvature-dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--ops", nargs="+", choices=("gate_proj", "up_proj"),
-                        default=["gate_proj", "up_proj"])
+                        default=["A"])
     parser.add_argument("--layer-start", type=int, default=0)
     parser.add_argument("--layer-end", type=int, help="Exclusive layer index; defaults to all layers")
-    parser.add_argument("--alpha", type=float, default=0.0)
+    parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--sample-edge-num", type=int, default=100)
     parser.add_argument("--sample-edge-ratio", type=float, default=1.0)
     parser.add_argument("--shared-top-k", type=int, default=10)
@@ -204,7 +204,7 @@ def main():
 
     settings = vars(args) | {
         "prompt_count": len(inputs),
-        "edge_sampling_seed": 13,
+        "edge_sampling_seed": args.seed,
         "resolved_model_dtype": str(model.dtype),
         "prompt_tokens": [hidden.shape[1] for hidden in inputs],
     }
