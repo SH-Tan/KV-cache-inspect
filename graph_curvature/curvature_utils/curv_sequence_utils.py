@@ -132,20 +132,13 @@ def _precompute_vproj_next_distributions(
     value_map,
     node_name,
     alpha,
-    l2_norm=False,
-    l2_norm_mode="per_example",
-    l2_reference=None,
 ):
     out = _build_node_distribution(
         value_map,
         node_name,
         alpha,
-        l2_norm=l2_norm,
-        l2_norm_mode=l2_norm_mode,
-        l2_reference=l2_reference,
     )
     return out
-
 
 
 def _precompute_oproj_prev_distributions(
@@ -153,9 +146,6 @@ def _precompute_oproj_prev_distributions(
     seq_len,
     node_name,
     alpha,
-    l2_norm=False,
-    l2_norm_mode="per_example",
-    l2_reference=None,
 ):
     out = []
     for s in range(seq_len):
@@ -165,9 +155,6 @@ def _precompute_oproj_prev_distributions(
                 masked,
                 node_name,
                 alpha,
-                l2_norm=l2_norm,
-                l2_norm_mode=l2_norm_mode,
-                l2_reference=l2_reference,
             )
         )
     return out

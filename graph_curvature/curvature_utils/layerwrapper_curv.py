@@ -1,41 +1,78 @@
 import math
-
 import torch
+import torch.nn.functional as F
 
+def scaled_dot_product_attention(
+    query, key, value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    enable_gqa=False,
+):
+    """Return attention output and last-row attention probabilities.
 
-def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
-        is_causal=False, scale=None, enable_gqa=False):
-    """Return attention outputs and probabilities for activation collection."""
+    Supports full causal prefill (L=S) and single-token decoding (L=1).
+    A_last shape: [batch, query_heads, 1, key_length].
+    Assumes the decoding query is the latest token.
+    """
+    if dropout_p != 0.0:
+        raise ValueError("This collector is intended for inference (dropout_p=0).")
+
+    if is_causal and attn_mask is not None:
+        raise ValueError("Specify either is_causal or attn_mask.")
+
     L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
-    if is_causal:
-        assert attn_mask is None
-        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
 
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            if attn_mask.dim() <= 2:
-                attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-            else:
-                attn_bias = torch.zeros_like(attn_mask, dtype=query.dtype)
-                attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-        else:
-            attn_bias = attn_mask.to(dtype=query.dtype) + attn_bias
+    if is_causal and L not in (1, S):
+        raise NotImplementedError(
+            "Chunked cached prefill requires an explicit aligned causal mask."
+        )
 
     if enable_gqa:
-        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
-        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+        groups = query.size(-3) // key.size(-3)
+        key = key.repeat_interleave(groups, dim=-3)
+        value = value.repeat_interleave(groups, dim=-3)
 
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
 
-    attn_weight = attn_weight + attn_bias
+    # Only compute the final query's attention probabilities.
+    q_last = query[..., -1:, :]
 
-    attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
+    scores = torch.matmul(
+        q_last, key.transpose(-2, -1)
+    ) * scale_factor
 
-    return attn_weight @ value, attn_weight
+    if attn_mask is not None:
+        mask_last = attn_mask[..., -1:, :]
+
+        if mask_last.dtype == torch.bool:
+            scores = scores.masked_fill(~mask_last, float("-inf"))
+        else:
+            scores = scores + mask_last.to(scores.dtype)
+
+    # For the final token of causal self-attention,
+    # all keys are past or current, so no additional causal mask is needed.
+    A_last = torch.softmax(
+        scores, dim=-1, dtype=torch.float32
+    ).to(query.dtype)
+
+    if L == 1:
+        # Decoding: one query, no need for a full attention operation.
+        attn_output = A_last @ value
+    else:
+        # Prefill: compute outputs for all tokens without materializing full A.
+        attn_output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scale_factor,
+        )
+
+    return attn_output, A_last
 
 
 def _reshape_for_heads(x, num_heads, head_dim):
@@ -110,108 +147,57 @@ def _store_operation(op_bank, name, node, dtype=None):
     op_bank[name] = node
 
 
+@torch.no_grad()
 def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_dtype=None):
-    """Return next hidden states, CPU operation values, and attention dimensions.
+    """Run one decoder layer; retain only the CPU values needed for A curvature.
 
-    Operation values have shape [batch, sequence, features], except attention
-    probabilities A: [batch, query_heads, sequence, sequence]. gate_proj stores
-    the activated gate values. The returned hidden states stay on x.device.
+    layer_input/V keep all key tokens. A keeps the final query row in its original dtype; Att_out
+    and o_proj keep only that query's feature vectors. Full attention and MLP
+    computation still produce the hidden states required by the next layer.
     """
     if getattr(layer.self_attn, "sliding_window", None) is not None:
         raise NotImplementedError("The curvature collector supports full attention, not sliding-window attention")
+    
     operations = {}
+    
+    x_norm = layer.input_layernorm(x)
+    _store_operation(operations, "layer_input", x_norm, operation_dtype)
+    
+    num_heads, num_kv_heads, repeat, head_dim = _resolve_attention_dims(layer, model)
 
-    with torch.no_grad():
-        x_in = x
-        x_norm = layer.input_layernorm(x_in)
+    q = _reshape_for_heads(layer.self_attn.q_proj(x_norm), num_heads, head_dim)
+    k = _reshape_for_heads(layer.self_attn.k_proj(x_norm), num_kv_heads, head_dim)
+    v_linear = layer.self_attn.v_proj(x_norm)
+    
+    _store_operation(operations, "v_proj", v_linear, operation_dtype)
+    
+    v = _reshape_for_heads(v_linear, num_kv_heads, head_dim)
+    del v_linear, x_norm
 
-        # Attention inputs and projections.
-        _store_operation(operations, "layer_input", x_norm, operation_dtype)
-        num_heads, num_kv_heads, num_kv_groups, head_dim = _resolve_attention_dims(layer, model)
+    if hasattr(layer.self_attn, "q_norm"):
+        q, k = layer.self_attn.q_norm(q), layer.self_attn.k_norm(k)
+    cos, sin = model.model.rotary_emb(x, position_ids)
+    q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+    del cos, sin
+    
+    k, v = _repeat_kv(k, repeat), _repeat_kv(v, repeat)
+    
+    attn_output, attention = scaled_dot_product_attention(
+        q, k, v, attn_mask=attention_mask,
+        is_causal=attention_mask is None,
+        scale=getattr(layer.self_attn, "scaling", None),
+    )
+    attn_context = _merge_heads(attn_output)
+    _store_operation(operations, "A", attention)
+    _store_operation(operations, "Att_out", attn_context[:, -1:], operation_dtype)
+    del q, k, v, attention, attn_output
 
-        q_linear = layer.self_attn.q_proj(x_norm)
-        k_linear = layer.self_attn.k_proj(x_norm)
-        v_linear = layer.self_attn.v_proj(x_norm)
-
-        q = _reshape_for_heads(q_linear, num_heads, head_dim)
-        k = _reshape_for_heads(k_linear, num_kv_heads, head_dim)
-        v = _reshape_for_heads(v_linear, num_kv_heads, head_dim)
-
-        if hasattr(layer.self_attn, "q_norm"):
-            q = layer.self_attn.q_norm(q)
-            k = layer.self_attn.k_norm(k)
-
-        # Apply positional rotation before collecting Q/K values.
-        if position_ids is not None:
-            cos, sin = model.model.rotary_emb(x_norm, position_ids)
-            q, k = _apply_rotary_pos_emb(q, k, cos, sin)
-            del cos, sin
-
-        # Store unexpanded K/V; repeat them only for attention computation.
-        _store_operation(operations, "q_proj", _merge_heads(q), operation_dtype)
-        _store_operation(operations, "k_proj", _merge_heads(k), operation_dtype)
-        _store_operation(operations, "v_proj", v_linear, operation_dtype)
-        del q_linear, k_linear, v_linear, x_norm
-
-        k = _repeat_kv(k, num_kv_groups)
-        v = _repeat_kv(v, num_kv_groups)
-
-        attn_output, A = scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=attention_mask is None,
-            scale=getattr(layer.self_attn, "scaling", None),
-        )
-
-        attn_context = _merge_heads(attn_output)
-
-        _store_operation(operations, "A", A, operation_dtype)
-        _store_operation(operations, "Att_out", attn_context, operation_dtype)
-        del q, k, v, A, attn_output
-
-        # Attention output and residual connection.
-        o = layer.self_attn.o_proj(attn_context)
-        residual_multiplier = getattr(layer, "residual_multiplier", 1.0)
-        x_res1 = x_in + o * residual_multiplier
-        x_norm2 = layer.post_attention_layernorm(x_res1)
-
-        _store_operation(operations, "o_proj", o, operation_dtype)
-        _store_operation(operations, "x_norm2", x_norm2, operation_dtype)
-        del attn_context, o
-
-        # Gated MLP and residual connection.
-        gate = layer.mlp.gate_proj(x_norm2)
-        up = layer.mlp.up_proj(x_norm2)
-        act = layer.mlp.act_fn(gate)
-        mlp_hidden = act * up
-
-        down = layer.mlp.down_proj(mlp_hidden)
-        x_out = x_res1 + down * residual_multiplier
-
-        _store_operation(operations, "gate_proj", act, operation_dtype)
-        _store_operation(operations, "up_proj", up, operation_dtype)
-        _store_operation(operations, "gate_up_out", mlp_hidden, operation_dtype)
-        _store_operation(operations, "down_proj", down, operation_dtype)
-
-    return x_out, operations, num_heads, num_kv_heads, num_kv_groups, head_dim
-
-
-def _make_lm_head_op(model, final_hidden):
-    # Cached final hidden states stay on CPU to save GPU memory.
-    # Move it onto the norm/lm_head device just for this forward, then return CPU probs.
-    if hasattr(model.model, "norm") and model.model.norm is not None:
-        norm_device = model.model.norm.weight.device
-        final_hidden = final_hidden.to(norm_device, non_blocking=True)
-        final_hidden = model.model.norm(final_hidden)
-
-    lm_head_device = model.lm_head.weight.device
-    final_hidden = final_hidden.to(lm_head_device, non_blocking=True)
-    logits = model.lm_head(final_hidden)
-    probs = torch.softmax(logits.float(), dim=-1).detach().cpu()
-    result = {"lm_head": probs}
-    del final_hidden, logits, probs
-
-    return result
+    projected = layer.self_attn.o_proj(attn_context)
+    _store_operation(operations, "o_proj", projected[:, -1:], operation_dtype)
+    del attn_context
+    
+    residual_multiplier = getattr(layer, "residual_multiplier", 1.0)
+    residual = x + projected * residual_multiplier
+    del projected
+    x_out = residual + layer.mlp(layer.post_attention_layernorm(residual)) * residual_multiplier
+    return x_out, operations

@@ -15,18 +15,13 @@ COMPUTE_DEVICE="${COMPUTE_DEVICE:-cpu}"
 DTYPE="${DTYPE:-auto}"
 CURVATURE_DTYPE="${CURVATURE_DTYPE:-float32}"
 TASK="${TASK:-longbench_lcc}"
-NUM_SAMPLES="${NUM_SAMPLES:-1}"
-MAX_LENGTH="${MAX_LENGTH:-128}"
-OPS="${OPS:-gate_proj up_proj}"
+NUM_SAMPLES="${NUM_SAMPLES:-50}"
+MAX_LENGTH="${MAX_LENGTH:-}"
 LAYER_START="${LAYER_START:-0}"
 LAYER_END="${LAYER_END:-}"
 ALPHA="${ALPHA:-0.0}"
-SAMPLE_EDGE_NUM="${SAMPLE_EDGE_NUM:-100}"
-SAMPLE_EDGE_RATIO="${SAMPLE_EDGE_RATIO:-1.0}"
-SHARED_TOP_K="${SHARED_TOP_K:-10}"
-SHARED_SEQ_SELECT="${SHARED_SEQ_SELECT:-top}"
-L2_NORM="${L2_NORM:-0}"
-WORKERS="${WORKERS:-1}"
+# This A40 host has 48 physical cores / 96 logical CPUs.
+WORKERS="${WORKERS:-48}"
 SEED="${SEED:-29}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-1}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
@@ -46,22 +41,19 @@ fi
 if [ "$TRUST_REMOTE_CODE" = 1 ]; then
   flags+=(--trust-remote-code)
 fi
-if [ "$L2_NORM" = 1 ]; then
-  flags+=(--l2-norm)
-fi
 if [ -n "$LAYER_END" ]; then
   flags+=(--layer-end "$LAYER_END")
 fi
-read -r -a operations <<< "$OPS"
+if [ -n "$MAX_LENGTH" ]; then
+  flags+=(--max-length "$MAX_LENGTH")
+fi
 
 "$PYTHON_BIN" "$SCRIPT_DIR/run_experiment.py" \
   --model-path "$MODEL_PATH" --tokenizer-path "$TOKENIZER_PATH" \
   --cache-dir "$CACHE_DIR" --output-dir "$OUTPUT_DIR" \
   --device "$DEVICE" --compute-device "$COMPUTE_DEVICE" \
   --dtype "$DTYPE" --curvature-dtype "$CURVATURE_DTYPE" \
-  --task "$TASK" --num-samples "$NUM_SAMPLES" --max-length "$MAX_LENGTH" \
-  --ops "${operations[@]}" --layer-start "$LAYER_START" \
-  --alpha "$ALPHA" --sample-edge-num "$SAMPLE_EDGE_NUM" \
-  --sample-edge-ratio "$SAMPLE_EDGE_RATIO" \
-  --shared-top-k "$SHARED_TOP_K" --shared-seq-select "$SHARED_SEQ_SELECT" \
+  --task "$TASK" --num-samples "$NUM_SAMPLES" \
+  --layer-start "$LAYER_START" \
+  --alpha "$ALPHA" \
   --workers "$WORKERS" --seed "$SEED" "${flags[@]}"

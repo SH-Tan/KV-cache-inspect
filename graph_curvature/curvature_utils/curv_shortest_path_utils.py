@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 
-from graph_curvature.curvature_utils.curv_dtype_utils import curvature_torch_dtype
+from graph_curvature.curvature_utils.curv_attention_utils import _get_a_curr_dist
 from graph_curvature.curvature_utils.graph_relation import _resolve_graph_sets
 from graph_curvature.curvature_utils.curv_distribution_utils import _min_reduce_blocks
 from graph_curvature.curvature_utils.curv_tensor_utils import (
@@ -13,14 +13,6 @@ from graph_curvature.curvature_utils.curv_tensor_utils import (
 )
 
 SP_CACHE = {}
-
-
-def _cost_to_magnitude(matrix):
-    matrix = matrix.to(dtype=curvature_torch_dtype())
-    mag = torch.zeros_like(matrix)
-    finite = torch.isfinite(matrix) & (matrix > 0)
-    mag[finite] = 1.0 / matrix[finite]
-    return mag
 
 
 def _gate_up_shortest_path_dist(layer_cache, short_name, curr_dist, device):
@@ -52,6 +44,7 @@ def build_shortest_path_cache(
     graph_data=None,
     model_meta=None,
     include_qk_next=True,
+    seq_idx=0,
 ):
     """
     Cache is flat: sp_cache[short_name] = ...
@@ -63,27 +56,30 @@ def build_shortest_path_cache(
     if graph_data is None:
         graph_data = _resolve_graph_sets(operations, short_name)
 
-    if (short_name not in {"q_proj", "k_proj"}) and (short_name in sp_cache):
+    if (short_name not in {"q_proj", "k_proj", "A"}) and (short_name in sp_cache):
         return sp_cache[short_name], graph_data
 
-    # 1/|w| and transpose shape = (int, out)
-    curr_dist = _get_matrix_torch(layer_cache, short_name, device=device)
+    # Current costs have shape [in_features, out_features].
+    if short_name == "A":
+        curr_dist = _get_a_curr_dist(operations, device=device, seq_idx=seq_idx)
+    else:
+        curr_dist = _get_matrix_torch(layer_cache, short_name, device=device)
     if curr_dist is None:
         return None, graph_data
 
+    # For A, the prev dists is W_v
     prev_dists = _all_cost_matrices(layer_cache, graph_data["prev_cost_names"], device=device)
-    residual_dists = _all_cost_matrices(layer_cache, graph_data.get("residual_names", []), device=device)
 
     if short_name in {"q_proj", "k_proj"} and include_qk_next:
-        cost_n = graph_data["next_cost_names"][0]
-        cost = operations.get(cost_n)
-        if model_meta is None:
-            raise ValueError(f"model_meta is required for {short_name}")
-        next_dists = {
-            name: _get_qk_next_cost(cost, short_name, model_meta, device=device)
-            for name in graph_data["next_cost_names"]
-        }
-
+            cost_n = graph_data["next_cost_names"][0]
+            cost = operations.get(cost_n)
+            if model_meta is None:
+                raise ValueError(f"model_meta is required for {short_name}")
+            next_dists = {
+                name: _get_qk_next_cost(cost, short_name, model_meta, device=device)
+                for name in graph_data["next_cost_names"]
+            }
+    # A will go into this branch, next is W_o, prev is W_v
     else:
         next_names = [] if short_name in {"q_proj", "k_proj"} else graph_data["next_cost_names"]
         next_dists = _all_cost_matrices(layer_cache, next_names, device=device)
@@ -91,7 +87,6 @@ def build_shortest_path_cache(
     chunk_k, chunk_p = adaptive_chunksize(device=device)
 
     curr_dist_np = curr_dist.cpu().contiguous().numpy()
-    curr_weight_magnitude_np = _cost_to_magnitude(curr_dist).cpu().contiguous().numpy()
     curr_path_dist = _gate_up_shortest_path_dist(layer_cache, short_name, curr_dist, device)
     curr_out_to_next_np = (
         _min_reduce_blocks([v.cpu().contiguous().numpy() for v in next_dists.values()])
@@ -194,7 +189,6 @@ def build_shortest_path_cache(
 
     sp = {
         "curr_dist": curr_dist_np,
-        "curr_weight_magnitude": curr_weight_magnitude_np,
         "prev_to_curr_in": prev_to_curr_in_np,
         "curr_out_to_next": curr_out_to_next_np,
         "prev_to_curr_out_all": prev_to_curr_out_all,

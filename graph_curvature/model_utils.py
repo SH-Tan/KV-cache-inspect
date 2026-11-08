@@ -1,8 +1,8 @@
-"""Reusable input capture and graph-cache selection for decoder-only LLMs."""
+"""Input capture and reusable V/O projection costs for the A-only runner."""
 
 import torch
 
-from .curvature_utils.graph_relation import GRAPH
+from .curvature_utils.curv_model_utils import _operation_distance_matrix_torch
 
 
 class _InputCaptured(Exception):
@@ -10,7 +10,7 @@ class _InputCaptured(Exception):
 
 
 @torch.no_grad()
-def capture_layer_inputs(model, tokenizer, prompts, max_length):
+def capture_layer_inputs(model, tokenizer, prompts, max_length=None):
     """Capture real first-layer inputs without running the remaining model."""
     inputs = []
 
@@ -22,7 +22,7 @@ def capture_layer_inputs(model, tokenizer, prompts, max_length):
     handle = model.model.layers[0].register_forward_pre_hook(capture, with_kwargs=True)
     try:
         for prompt in prompts:
-            tokens = tokenizer(prompt, return_tensors="pt", truncation=True,
+            tokens = tokenizer(prompt, return_tensors="pt", truncation=max_length is not None,
                                max_length=max_length)
             tokens = tokens.to(model.model.embed_tokens.weight.device)
             try:
@@ -34,14 +34,9 @@ def capture_layer_inputs(model, tokenizer, prompts, max_length):
     return inputs
 
 
-def required_cache_names(target_ops, operations):
-    names = set()
-    for short in target_ops:
-        names.add(short)
-        relation = GRAPH[short]
-        names.update(relation.get("prev", []))
-        names.update(relation.get("next", []))
-        names.update(relation.get("residual", []))
-    # Gate/up shortest paths use the minimum cost across the two branches.
-    names.update(("gate_proj", "up_proj"))
-    return names.intersection(operations)
+def build_a_layer_cache(model, layer_id, device="cpu"):
+    """Copy V/O costs once per layer; reuse them across all prompts and key tokens."""
+    return {
+        f"{name}__dist": _operation_distance_matrix_torch(model, name, layer_id, device).cpu()
+        for name in ("v_proj", "o_proj")
+    }

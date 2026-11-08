@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load a model and LongBench prompts, collect layer values, and calculate curvature."""
+"""Load a model and LongBench prompts, collect layer values, and calculate A curvature."""
 
 import argparse
 from itertools import islice
@@ -14,14 +14,16 @@ import torch
 from lm_eval.tasks import TaskManager
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
-from graph_curvature.curvature_utils import cal_curvature
+from graph_curvature.curvature_utils.cal_curvature_A import compute_a_curvature
+from graph_curvature.curvature_utils.curv_analysis_utils import (
+    _summarize_curvatures, rank_a_curvature, write_curvature_summary,
+)
+from graph_curvature.curvature_utils.curv_distribution_utils import _NEIGHBOR_KEEP_QUANTILE
 from graph_curvature.curvature_utils.curv_dtype_utils import (
     curvature_torch_dtype, set_curvature_dtype,
 )
-from graph_curvature.curvature_utils.curv_tensor_utils import build_layer_cache
-from graph_curvature.curvature_utils.graph_relation import GRAPH
 from graph_curvature.curvature_utils.layerwrapper_curv import collect_layer_data
-from graph_curvature.model_utils import capture_layer_inputs, required_cache_names
+from graph_curvature.model_utils import capture_layer_inputs, build_a_layer_cache
 
 
 def parse_args():
@@ -33,7 +35,8 @@ def parse_args():
     parser.add_argument("--cache-dir", default=str(REPO_DIR / "llm_weights"))
     parser.add_argument("--task", default="longbench_lcc")
     parser.add_argument("--num-samples", type=int, default=1)
-    parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--max-length", type=int,
+                        help="Optional prompt token cap; defaults to the complete prompt")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
     parser.add_argument("--local-files-only", action="store_true")
@@ -42,35 +45,24 @@ def parse_args():
     # Curvature settings.
     parser.add_argument("--compute-device", default="cpu")
     parser.add_argument("--curvature-dtype", choices=("float32", "float64"), default="float32")
-    parser.add_argument("--ops", nargs="+", choices=("gate_proj", "up_proj"),
-                        default=["A"])
     parser.add_argument("--layer-start", type=int, default=0)
     parser.add_argument("--layer-end", type=int, help="Exclusive layer index; defaults to all layers")
-    parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--sample-edge-num", type=int, default=100)
-    parser.add_argument("--sample-edge-ratio", type=float, default=1.0)
-    parser.add_argument("--shared-top-k", type=int, default=10)
-    parser.add_argument("--shared-seq-select", choices=("top", "median", "last"), default="top")
-    parser.add_argument("--l2-norm", action="store_true")
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--alpha", type=float, default=0.0)
+    parser.add_argument("--workers", type=int, default=48,
+                        help="CPU curvature processes; default: 48 physical cores on the A40 host")
     parser.add_argument("--seed", type=int, default=29)
     parser.add_argument("--output-dir", required=True)
 
     args = parser.parse_args()
-    args.ops = list(dict.fromkeys(args.ops))
 
     # Reject settings that would silently skip work or make curvature undefined.
-    for name in ("num_samples", "max_length", "workers"):
+    for name in ("num_samples", "workers"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if not 0 <= args.alpha < 1:
         parser.error("--alpha must be in [0, 1)")
-    if not 0 < args.sample_edge_ratio <= 1:
-        parser.error("--sample-edge-ratio must be in (0, 1]")
-    for name in ("sample_edge_num", "shared_top_k"):
-        value = getattr(args, name)
-        if value != -1 and value < 1:
-            parser.error(f"--{name.replace('_', '-')} must be positive or -1")
+    if args.max_length is not None and args.max_length < 1:
+        parser.error("--max-length must be positive")
 
     return args
 
@@ -92,87 +84,67 @@ def load_model(args):
 
 
 def load_dataset(args):
-    """Take the first N test prompts using the installed lm-eval task template.
-
-    LCC has the shortest average inputs in the published LongBench statistics.
-    Token truncation happens later, when capturing first-layer inputs.
-    """
+    """Take the first N test prompts from the selected lm-eval task."""
     task = TaskManager().load([args.task])["tasks"][args.task]
     return [task.doc_to_text(doc) for doc in islice(task.test_docs(), args.num_samples)]
 
 
 @torch.no_grad()
 def calculate_layer_curvature(model, layer_id, inputs, args):
-    """Update inputs to the next hidden states and return per-operation scores.
-
-    Scores have shape [out_features, in_features] and take the minimum across
-    samples. Graph costs are built once for this layer and reused.
-    """
+    """Propagate prompts and save each prompt's last-row A scores independently."""
     layer = model.model.layers[layer_id]
-    layer_cache, sp_cache, scores = {}, {}, {}
-    analysis_dir = str(Path(args.output_dir) / "analysis")
+    calculate = layer_id >= args.layer_start
+    layer_cache = build_a_layer_cache(model, layer_id, args.compute_device) if calculate else None
+    layer_dir = Path(args.output_dir) / f"layer_{layer_id:03d}"
+    if calculate:
+        layer_dir.mkdir(parents=True, exist_ok=True)
+    prompt_records = []
+    prompt_tokens = [hidden.shape[1] for hidden in inputs]
 
-    try:
-        for sample_idx, hidden in enumerate(inputs):
-            positions = torch.arange(hidden.shape[1], device=args.device).unsqueeze(0)
-            hidden_out, operations, q_heads, kv_heads, repeat, head_dim = collect_layer_data(
-                layer, hidden.to(args.device), None, positions, model,
-                operation_dtype=curvature_torch_dtype(),
-            )
-            inputs[sample_idx] = hidden_out.cpu()
-            del hidden_out
-
-            # Earlier layers only propagate hidden states to the requested range.
-            if layer_id < args.layer_start:
-                del operations
-                continue
-
-            if not layer_cache:
-                build_layer_cache(
-                    model, operations, layer_id, layer_cache,
-                    device=args.compute_device,
-                    required_names=required_cache_names(args.ops, operations),
-                )
-
-            for name in args.ops:
-                curvature = cal_curvature.compute_op_curvature(
-                    operations=operations, short_name=name, layer_id=layer_id,
-                    sample_idx=sample_idx, layer_cache=layer_cache, sp_cache=sp_cache,
-                    alpha=args.alpha, device=args.compute_device, seq_len=hidden.shape[1],
-                    num_q_heads=q_heads, num_kv_heads=kv_heads, head_dim=head_dim, repeat=repeat,
-                    sample_edge_num=args.sample_edge_num, sample_edge_ratio=args.sample_edge_ratio,
-                    dataset_name=args.task, l2_norm=args.l2_norm,
-                    shared_top_k=args.shared_top_k, shared_seq_select=args.shared_seq_select,
-                    analysis_dir=analysis_dir,
-                )
-                if name in scores:
-                    torch.minimum(scores[name], curvature, out=scores[name])
-                else:
-                    scores[name] = curvature
-                del curvature
-
+    for sample_idx, hidden in enumerate(inputs):
+        positions = torch.arange(hidden.shape[1], device=args.device).unsqueeze(0)
+        hidden_out, operations = collect_layer_data(
+            layer, hidden.to(args.device), None, positions, model,
+            operation_dtype=curvature_torch_dtype(),
+        )
+        inputs[sample_idx] = hidden_out.cpu()
+        del hidden_out
+        if not calculate:
             del operations
+            continue
 
-        return scores
-    finally:
-        # The solver holds process-global tensor views; release them after each layer.
-        cal_curvature._reset_shared_state()
+        curvature, metrics = compute_a_curvature(
+            operations, layer_cache, alpha=args.alpha, device=args.compute_device,
+            workers=args.workers,
+        )
+        metrics['curvature'] = _summarize_curvatures(curvature)
+        prompt_records.append(metrics)
+        path = layer_dir / f"prompt_{sample_idx:05d}.pt"
+        torch.save({
+            "layer_id": layer_id,
+            "prompt_id": sample_idx,
+            "token_count": hidden.shape[1],
+            "query_index": hidden.shape[1] - 1,
+            "attention_scores": operations['A'][0, :, 0].contiguous(),
+            "curvature_scores": {"A": curvature},
+            "curvature_ranking": rank_a_curvature(curvature),
+        }, path)
+        print(f"Saved {path}", flush=True)
+        del curvature, operations
+
+    if prompt_records:
+        log_path = Path(args.output_dir) / "analysis" / f"layer_{layer_id:03d}_A_summary.txt"
+        write_curvature_summary(log_path, prompt_tokens, prompt_records)
 
 
 def calculate_curvature(model, inputs, args):
     """Save each layer's scores immediately, keeping only one layer on the GPU."""
-    output = Path(args.output_dir)
     model.model.rotary_emb.to(args.device)
 
     for layer_id in range(args.layer_end):
         layer = model.model.layers[layer_id].to(args.device)
         try:
-            scores = calculate_layer_curvature(model, layer_id, inputs, args)
-            if scores:
-                path = output / f"layer_{layer_id:03d}.pt"
-                torch.save({"layer_id": layer_id, "curvature_scores": scores}, path)
-                print(f"Saved {path}", flush=True)
-            del scores
+            calculate_layer_curvature(model, layer_id, inputs, args)
         finally:
             layer.to("cpu")
             if str(args.device).startswith("cuda"):
@@ -186,10 +158,10 @@ def main():
     if any(output.iterdir()):
         raise FileExistsError(f"Use an empty output directory to keep runs separate: {output}")
 
+    # CPU curvature uses multiple processes, each with one Torch thread.
     torch.set_num_threads(1)
     set_seed(args.seed)
     set_curvature_dtype(args.curvature_dtype)
-    cal_curvature.proc = args.workers
 
     # 1. Load model and dataset.
     model, tokenizer = load_model(args)
@@ -204,12 +176,14 @@ def main():
 
     settings = vars(args) | {
         "prompt_count": len(inputs),
-        "edge_sampling_seed": args.seed,
         "resolved_model_dtype": str(model.dtype),
         "prompt_tokens": [hidden.shape[1] for hidden in inputs],
+        "total_token_length": sum(hidden.shape[1] for hidden in inputs),
+        "neighbor_keep_quantile": _NEIGHBOR_KEEP_QUANTILE,
+        "attention_edge_definition": "head_feature_sets_with_shortest_boundary_distances",
+        "curvature_ranking_order": "descending",
     }
     (output / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
-    (output / "graph.json").write_text(json.dumps(GRAPH, indent=2) + "\n")
 
     # 3. Collect each layer's values, calculate curvature, and save the scores.
     calculate_curvature(model, inputs, args)

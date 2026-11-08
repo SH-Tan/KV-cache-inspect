@@ -1,9 +1,9 @@
 from graph_curvature.curvature_utils.curv_distribution_utils import _resolve_node_name
 
 GRAPH = {
-    "q_proj": {"layer": 1, "prev": [], "next": ["A"], "prev_in": [], "next_out": ["Att_out"]},
-    "k_proj": {"layer": 1, "prev": [], "next": ["A"], "prev_in": [], "next_out": ["Att_out"]},
-    "v_proj": {"layer": 1, "prev": [], "next": ["A"], "prev_in": [], "next_out": ["Att_out"]},
+    "q_proj": {"layer": 1, "prev": [], "next": ["A"], "prev_in": [], "next_out": []},
+    "k_proj": {"layer": 1, "prev": [], "next": ["A"], "prev_in": [], "next_out": []},
+    "v_proj": {"layer": 1, "prev": ["layer_input"], "next": ["A"], "prev_in": [], "next_out": []},
     "A": {"layer": 2, "prev": ["v_proj"], "next": ["o_proj"], "prev_in": ["layer_input"], "next_out": ["o_proj"]},
     "o_proj": {"layer": 3, "prev": ["A"], "next": [], "prev_in": [], "next_out": []},
 }

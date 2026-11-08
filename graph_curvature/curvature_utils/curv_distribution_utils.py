@@ -5,7 +5,7 @@ import torch
 
 from graph_curvature.curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 
-_NEIGHBOR_KEEP_QUANTILE = 0.9
+_NEIGHBOR_KEEP_QUANTILE = 0.7
 
 
 def minmax_per_batch_nonzero_nozero(x, eps=1e-4, dim=-1):
@@ -177,32 +177,16 @@ def _reduce_distribution_to_top_quantile_np(scaled, dist, alpha, eps, keep_quant
     return _renormalize_dist_from_scaled_np(scaled, keep, alpha, eps)
 
 
-def _all_examples_l2_tensor(node_tensor, l2_reference, node_name):
-    ref_tensor = torch.as_tensor(l2_reference, dtype=curvature_torch_dtype()).reshape(1, -1)
-    if ref_tensor.shape[-1] != node_tensor.shape[-1]:
-        raise ValueError(
-            f"Invalid {node_name} all-example L2 reference width "
-            f"{ref_tensor.shape[-1]}, expected {node_tensor.shape[-1]}"
-        )
-    return ref_tensor
-
-
 def _build_node_distribution(
     node_tensor,
     node_name,
     alpha,
     eps=1e-7,
-    l2_norm=False,
-    l2_norm_mode="per_example",
-    l2_reference=None,
 ):
     if node_tensor is None or node_tensor.numel() == 0:
         return None
 
-    if l2_norm and l2_norm_mode == "all_examples" and l2_reference is not None:
-        node_tensor = _all_examples_l2_tensor(node_tensor, l2_reference, node_name)
-    else:
-        node_tensor = node_tensor.to(dtype=curvature_torch_dtype())
+    node_tensor = node_tensor.to(dtype=curvature_torch_dtype())
 
     if node_tensor.dim() == 3:
         if node_tensor.shape[0] != 1:
@@ -210,9 +194,6 @@ def _build_node_distribution(
                 f"Expected batch size 1 for node tensor, got shape {tuple(node_tensor.shape)}"
             )
         node_tensor = node_tensor.squeeze(0)
-
-    if l2_norm and node_tensor.dim() == 2:
-        node_tensor = torch.norm(node_tensor, p=2, dim=0, keepdim=True)
 
     node_tensor = _normalize_node_value_per_sequence(node_tensor)
 
@@ -225,16 +206,11 @@ def _build_node_distribution(
 def _build_distribution_node_values(
     node_tensor,
     seq_len,
-    l2_norm=False,
-    l2_norm_mode="per_example",
-    l2_reference=None,
 ):
     if node_tensor is None:
         return None
 
-    if l2_norm and l2_norm_mode == "all_examples" and l2_reference is not None:
-        tensor = _all_examples_l2_tensor(node_tensor, l2_reference, "node")
-    elif torch.is_tensor(node_tensor):
+    if torch.is_tensor(node_tensor):
         tensor = node_tensor.detach().cpu()
         if torch.is_floating_point(tensor):
             tensor = tensor.to(dtype=curvature_torch_dtype())
@@ -255,10 +231,7 @@ def _build_distribution_node_values(
     elif tensor.dim() != 2:
         return None
 
-    if l2_norm:
-        tensor = torch.norm(tensor, p=2, dim=0, keepdim=True)
-    else:
-        tensor = tensor[:int(seq_len)].contiguous()
+    tensor = tensor[:int(seq_len)].contiguous()
 
     values = tensor.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
     return np.abs(values)
@@ -294,41 +267,16 @@ def _build_block_row_node_distribution(
     node_tensor,
     alpha,
     eps=1e-7,
-    l2_norm=False,
-    l2_reference=None,
 ):
     if node_tensor is None or node_tensor.numel() == 0:
         return None
 
     node_tensor = node_tensor.to(dtype=curvature_torch_dtype())
 
-    if l2_norm and l2_reference is not None:
-        ref_tensor = torch.as_tensor(
-            l2_reference,
-            dtype=curvature_torch_dtype(),
-            device=node_tensor.device,
-        )
-
-        expected_shape = (node_tensor.shape[0], node_tensor.shape[2])
-
-        if ref_tensor.shape == expected_shape:
-            node_tensor = ref_tensor.unsqueeze(1)
-        elif ref_tensor.numel() == int(np.prod(expected_shape)):
-            node_tensor = ref_tensor.reshape(*expected_shape).unsqueeze(1)
-        else:
-            raise ValueError(
-                f"Invalid l2_reference shape {tuple(ref_tensor.shape)}, "
-                f"expected {expected_shape} or numel={int(np.prod(expected_shape))}"
-            )
-
-    if l2_norm:
-        node_tensor = torch.norm(node_tensor, p=2, dim=1, keepdim=True)
-
     # Normalize each row over the feature axis, then distribution-normalize
     # each row over the same axis.
     # q_proj: [q_heads, seq_q, seq_k] -> per (head, seq_q) over seq_k.
     # k_proj: [k_heads, seq_k, seq_q * repeat] -> per (head, seq_k) over features.
-    # L2: [heads, 1, feature_axis] -> per head over feature_axis.
     node_tensor = _normalize_node_value_per_sequence(node_tensor, dim=-1)
 
     valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
@@ -340,25 +288,10 @@ def _build_block_row_node_distribution(
     )
 
 
-def _check_qk_l2_reference_shape(l_name, l2_reference, expected_shape):
-    if l2_reference is None:
-        return
-
-    ref_shape = tuple(torch.as_tensor(l2_reference).shape)
-    if ref_shape != tuple(expected_shape):
-        raise ValueError(
-            f"Invalid {l_name} A L2 reference shape {ref_shape}, "
-            f"expected {tuple(expected_shape)}"
-        )
-
-
 def _build_qk_out_node_distribution(
     l_name,
     node,
     alpha,
-    l2_norm=False,
-    l2_norm_mode="per_example",
-    l2_reference=None,
     repeat=1,
 ):
     if node is None or node.numel() == 0:
@@ -369,9 +302,7 @@ def _build_qk_out_node_distribution(
             f"Expected A node shape [B, q_heads, seq, seq], got {tuple(node.shape)}"
         )
 
-    if l2_norm and l2_norm_mode == "all_examples" and l2_reference is not None:
-        A = node[0].contiguous()
-    elif node.shape[0] != 1:
+    if node.shape[0] != 1:
         raise ValueError(
             f"Expected batch size 1 for A node, got shape {tuple(node.shape)}"
         )
@@ -392,8 +323,6 @@ def _build_qk_out_node_distribution(
         # Shape: [q_heads, seq_q, seq_k].
         # Distribution rows are per (q_head, seq_q) over seq_k.
         out_node = A
-        if l2_norm and l2_reference is not None:
-            _check_qk_l2_reference_shape(l_name, l2_reference, (q_heads, seq_k))
 
     elif l_name == "k_proj":
         # K node:
@@ -424,8 +353,6 @@ def _build_qk_out_node_distribution(
              .reshape(k_heads, seq_k, seq_q * repeat)
              .contiguous()
         )
-        if l2_norm and l2_reference is not None:
-            _check_qk_l2_reference_shape(l_name, l2_reference, (k_heads, seq_q * repeat))
 
     else:
         raise ValueError(f"Unsupported l_name={l_name}")
@@ -433,8 +360,6 @@ def _build_qk_out_node_distribution(
     return _build_block_row_node_distribution(
         out_node,
         alpha=alpha,
-        l2_norm=l2_norm,
-        l2_reference=l2_reference,
     )
 
 
