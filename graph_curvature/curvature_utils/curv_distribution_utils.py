@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import torch
 
@@ -9,7 +7,7 @@ _NEIGHBOR_KEEP_QUANTILE = 0.7
 
 
 def minmax_per_batch_nonzero_nozero(x, eps=1e-4, dim=-1):
-    mask = x != 0
+    mask = torch.isfinite(x) & (x != 0)
 
     xmin = x.masked_fill(~mask, float("inf")).amin(dim=dim, keepdim=True)
     xmax = x.masked_fill(~mask, float("-inf")).amax(dim=dim, keepdim=True)
@@ -35,43 +33,23 @@ def _normalize_node_value_per_sequence(node_val, dim=-1):
     return 1.0 / node_norm
 
 
-def _resolve_node_name(operations, names):
-    for name in names:
-        if not name:
-            continue
-        if name in operations:
-            return name
-    return None
-
-
 def _edge_distribution(dist_row_or_col, alpha):
     if dist_row_or_col is None:
-        return np.array([1.0], dtype=curvature_np_dtype()), np.empty((0,), dtype=np.int64)
+        return np.array([1.0]), np.empty((0,), dtype=np.int64)
 
-    probs = np.asarray(dist_row_or_col, dtype=curvature_np_dtype()).reshape(-1).copy()
+    probs = np.asarray(dist_row_or_col).reshape(-1)
 
     non_zero = np.nonzero(probs)[0]
     if non_zero.size == 0:
-        return np.array([1.0], dtype=curvature_np_dtype()), np.empty((0,), dtype=np.int64)
+        return np.array([1.0]), np.empty((0,), dtype=np.int64)
 
-    if np.any(probs == -1.0):
-        tmp = (1.0 - alpha) / non_zero.size
-        probs[probs == -1.0] = tmp
+    mass = probs[non_zero].astype(np.float64)
+    if np.any(mass == -1.0):
+        mass[mass == -1.0] = (1.0 - alpha) / non_zero.size
+    # Preserve exact center mass; float32 summation must not perturb its balance.
+    mass *= (1.0 - alpha) / mass.sum()
 
-    return np.hstack((probs[non_zero], np.array([alpha], dtype=curvature_np_dtype()))), non_zero
-
-
-def _min_reduce_blocks(blocks):
-    """Elementwise minimum without stacking dense matrices or modifying inputs."""
-    blocks = list(blocks)
-    if not blocks:
-        return None
-    if len(blocks) == 1:
-        return np.asarray(blocks[0], dtype=curvature_np_dtype())
-    result = np.array(blocks[0], dtype=curvature_np_dtype(), copy=True)
-    for block in blocks[1:]:
-        np.minimum(result, np.asarray(block, dtype=curvature_np_dtype()), out=result)
-    return result
+    return np.r_[mass, alpha], non_zero
 
 
 def _renormalize_dist_from_scaled_torch(scaled, keep_mask, alpha, eps):
@@ -203,40 +181,6 @@ def _build_node_distribution(
     return dist.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
 
 
-def _build_distribution_node_values(
-    node_tensor,
-    seq_len,
-):
-    if node_tensor is None:
-        return None
-
-    if torch.is_tensor(node_tensor):
-        tensor = node_tensor.detach().cpu()
-        if torch.is_floating_point(tensor):
-            tensor = tensor.to(dtype=curvature_torch_dtype())
-    else:
-        tensor = torch.as_tensor(node_tensor, dtype=curvature_torch_dtype())
-
-    if tensor.numel() == 0:
-        return None
-
-    if tensor.dim() == 3:
-        if tensor.shape[0] != 1:
-            raise ValueError(
-                f"Expected batch size 1 for node values, got shape {tuple(tensor.shape)}"
-            )
-        tensor = tensor.squeeze(0)
-    elif tensor.dim() == 1:
-        tensor = tensor.reshape(1, -1)
-    elif tensor.dim() != 2:
-        return None
-
-    tensor = tensor[:int(seq_len)].contiguous()
-
-    values = tensor.detach().cpu().numpy().astype(curvature_np_dtype(), copy=False)
-    return np.abs(values)
-
-
 def _build_node_distribution_row_from_values(values, alpha, eps=1e-7, apply_neighbor_reduction=True):
     values = np.asarray(values, dtype=curvature_np_dtype()).reshape(-1)
     node_values = np.abs(values)
@@ -261,179 +205,3 @@ def _build_node_distribution_row_from_values(values, alpha, eps=1e-7, apply_neig
         eps,
         apply_neighbor_reduction=apply_neighbor_reduction,
     )
-
-
-def _build_block_row_node_distribution(
-    node_tensor,
-    alpha,
-    eps=1e-7,
-):
-    if node_tensor is None or node_tensor.numel() == 0:
-        return None
-
-    node_tensor = node_tensor.to(dtype=curvature_torch_dtype())
-
-    # Normalize each row over the feature axis, then distribution-normalize
-    # each row over the same axis.
-    # q_proj: [q_heads, seq_q, seq_k] -> per (head, seq_q) over seq_k.
-    # k_proj: [k_heads, seq_k, seq_q * repeat] -> per (head, seq_k) over features.
-    node_tensor = _normalize_node_value_per_sequence(node_tensor, dim=-1)
-
-    valid_mask = torch.isfinite(node_tensor) & (node_tensor != 0)
-    dist = _distribution_from_scaled_torch(node_tensor, valid_mask, alpha, eps)
-
-    return dist.detach().cpu().numpy().astype(
-        curvature_np_dtype(),
-        copy=False,
-    )
-
-
-def _build_qk_out_node_distribution(
-    l_name,
-    node,
-    alpha,
-    repeat=1,
-):
-    if node is None or node.numel() == 0:
-        return None
-
-    if node.dim() != 4:
-        raise ValueError(
-            f"Expected A node shape [B, q_heads, seq, seq], got {tuple(node.shape)}"
-        )
-
-    if node.shape[0] != 1:
-        raise ValueError(
-            f"Expected batch size 1 for A node, got shape {tuple(node.shape)}"
-        )
-    else:
-        # [1, q_heads, seq_q, seq_k] -> [q_heads, seq_q, seq_k]
-        A = node.squeeze(0).contiguous()
-    if A.shape[0] == A.shape[2] and A.shape[1] < A.shape[0]:
-        A = A.permute(1, 0, 2).contiguous()
-
-    q_heads, seq_q, seq_k = A.shape
-    repeat = max(int(repeat), 1)
-
-    if l_name == "q_proj":
-        # Q node:
-        # For each q head h and query token i:
-        # node = A[h, i, :]
-        #
-        # Shape: [q_heads, seq_q, seq_k].
-        # Distribution rows are per (q_head, seq_q) over seq_k.
-        out_node = A
-
-    elif l_name == "k_proj":
-        # K node:
-        # q_heads = k_heads * repeat
-        #
-        # Original:
-        #   A: [q_heads, seq_q, seq_k]
-        #
-        # Reshape repeated Q heads into K-head groups:
-        #   [k_heads, repeat, seq_q, seq_k]
-        #
-        # Then for each K head and key token j, collect all repeated
-        # Q-head/query-token attention values:
-        #   [k_heads, seq_k, seq_q * repeat]
-        # Feature axis order is [repeat, seq_q], matching _get_qk_next_cost.
-        #
-        # Distribution rows are per (k_head, seq_k) over seq_q * repeat.
-        if q_heads % repeat != 0:
-            raise ValueError(
-                f"q_heads={q_heads} is not divisible by repeat={repeat}"
-            )
-
-        k_heads = q_heads // repeat
-
-        out_node = (
-            A.reshape(k_heads, repeat, seq_q, seq_k)
-             .permute(0, 3, 1, 2)          # [k_heads, seq_k, repeat, seq_q]
-             .reshape(k_heads, seq_k, seq_q * repeat)
-             .contiguous()
-        )
-
-    else:
-        raise ValueError(f"Unsupported l_name={l_name}")
-
-    return _build_block_row_node_distribution(
-        out_node,
-        alpha=alpha,
-    )
-
-
-def draw_nonzero_distribution_curve(dist,
-    node_name=None,
-    save_path=None,
-    ignore_negative=True,
-    dpi=300,):
-    """
-    Draw smooth curve distribution of non-zero values in final dist.
-    No histogram bins.
-    """
-    if hasattr(dist, "detach"):
-        values = dist.detach().cpu().numpy()
-    else:
-        values = np.asarray(dist)
-
-    values = values.reshape(-1)
-
-    if ignore_negative:
-        nonzero_values = values[
-            (values != 0) & np.isfinite(values) & (values > 0)
-        ]
-    else:
-        nonzero_values = values[
-            (values != 0) & np.isfinite(values)
-        ]
-
-    nonzero_count = nonzero_values.size
-    print(f"[{node_name}] non-zero value number: {nonzero_count}")
-
-    if nonzero_count == 0:
-        print("No non-zero values to draw.")
-        return nonzero_values
-
-    if nonzero_count == 1:
-        print(f"Only one non-zero value: {nonzero_values[0]}")
-        return nonzero_values
-
-    sorted_values = np.sort(nonzero_values)
-    value_rank = np.arange(nonzero_count)
-
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(value_rank, sorted_values, linewidth=1.0)
-    ax.set_xlabel("Sorted non-zero value index")
-    ax.set_ylabel("Non-zero distribution value")
-    title = f"Sorted non-zero values, n={nonzero_count}"
-    if node_name is not None:
-        title += f" - {node_name}"
-    ax.set_title(title)
-    stats_text = (
-        f"min={sorted_values[0]:.4g}\n"
-        f"p50={np.percentile(sorted_values, 50):.4g}\n"
-        f"p95={np.percentile(sorted_values, 95):.4g}\n"
-        f"max={sorted_values[-1]:.4g}"
-    )
-    ax.text(
-        0.98,
-        0.95,
-        stats_text,
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
-    )
-    fig.tight_layout()
-
-    if save_path is not None:
-        save_dir = os.path.dirname(save_path)
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        print(f"Saved figure to: {save_path}")
-    plt.close(fig)
-    return nonzero_values

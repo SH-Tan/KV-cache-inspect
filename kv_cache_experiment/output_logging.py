@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 
 import torch
+from kvpress import PyramidKVPress
 from kvpress.utils import compute_n_kept
 
 
@@ -42,7 +43,8 @@ def record_compressed_prompt(press, context, tokenizer, record):
     def capture_score(module, hidden_states, keys, values, attentions, kwargs):
         scores = score(module, hidden_states, keys, values, attentions, kwargs)
         if module.layer_idx == 0:
-            n_kept = compute_n_kept(keys.shape[2], press.compression_ratio)
+            n_kept = (press.get_layer_budget(module, keys.shape[2]) if isinstance(press, PyramidKVPress)
+                      else compute_n_kept(keys.shape[2], press.compression_ratio))
             # Match ScorerPress's selection, including its handling of tied scores.
             positions = scores.topk(n_kept, dim=-1).indices[0, 0].sort().values
             token_ids = context[0].index_select(0, positions.to(context.device)).tolist()

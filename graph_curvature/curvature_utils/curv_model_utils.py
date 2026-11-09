@@ -38,7 +38,8 @@ def _weight_from_model(model, short_name, layer_id, device=None):
     if w.device.type == "cuda" and target_device.type == "cuda" and w.device != target_device:
         # Direct cross-GPU bf16 copies can silently zero weights on this setup.
         return w.cpu().to(device=target_device, non_blocking=True)
-    return w.to(device=target_device, non_blocking=True)
+    # CPU costs are consumed immediately, so device-to-host copies must finish.
+    return w.to(device=target_device, non_blocking=target_device.type == "cuda")
 
 
 def _operation_distance_matrix_torch(model, short_name, layer_id, device):

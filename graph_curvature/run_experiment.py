@@ -2,19 +2,22 @@
 """Load a model and LongBench prompts, collect layer values, and calculate A curvature."""
 
 import argparse
+import hashlib
 from itertools import islice
 import json
+import os
 from pathlib import Path
 import sys
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
 from lm_eval.tasks import TaskManager
-from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, set_seed
 
-from graph_curvature.curvature_utils.cal_curvature_A import compute_a_curvature
+from graph_curvature.curvature_utils.cal_curvature_A import CURVATURE_ALGORITHM_VERSION, compute_a_curvature
 from graph_curvature.curvature_utils.curv_analysis_utils import (
     _summarize_curvatures, rank_a_curvature, write_curvature_summary,
 )
@@ -24,6 +27,8 @@ from graph_curvature.curvature_utils.curv_dtype_utils import (
 )
 from graph_curvature.curvature_utils.layerwrapper_curv import collect_layer_data
 from graph_curvature.model_utils import capture_layer_inputs, build_a_layer_cache
+from kv_cache_experiment.comparison_utils import DEFAULT_METHODS, DEFAULT_RATIOS, configure_determinism
+from src.utils.cuda_memory_utils import release_cuda_memory
 
 
 def parse_args():
@@ -52,6 +57,10 @@ def parse_args():
                         help="CPU curvature processes; default: 48 physical cores on the A40 host")
     parser.add_argument("--seed", type=int, default=29)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--evaluate", action="store_true", help="Compare saved curvature with kvpress after calculation")
+    parser.add_argument("--presses", default=DEFAULT_METHODS)
+    parser.add_argument("--compression-ratios", default=DEFAULT_RATIOS)
+    parser.add_argument("--max-new-tokens", type=int, help="Evaluation generation cap; defaults to the task setting")
 
     args = parser.parse_args()
 
@@ -94,11 +103,12 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
     """Propagate prompts and save each prompt's last-row A scores independently."""
     layer = model.model.layers[layer_id]
     calculate = layer_id >= args.layer_start
-    layer_cache = build_a_layer_cache(model, layer_id, args.compute_device) if calculate else None
+    layer_cache = None
     layer_dir = Path(args.output_dir) / f"layer_{layer_id:03d}"
     if calculate:
         layer_dir.mkdir(parents=True, exist_ok=True)
     prompt_records = []
+    record_ids = []
     prompt_tokens = [hidden.shape[1] for hidden in inputs]
 
     for sample_idx, hidden in enumerate(inputs):
@@ -113,13 +123,26 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
             del operations
             continue
 
+        path = layer_dir / f"prompt_{sample_idx:05d}.pt"
+        if path.exists():
+            saved = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+            if saved['token_count'] != hidden.shape[1]:
+                raise ValueError(f"Saved curvature prompt length changed: {path}")
+            prompt_records.append(saved["metrics"])
+            record_ids.append(sample_idx)
+            print(f"Reusing {path}", flush=True)
+            del saved, operations
+            continue
+        if layer_cache is None:
+            layer_cache = build_a_layer_cache(model, layer_id, args.compute_device)
+
         curvature, metrics = compute_a_curvature(
             operations, layer_cache, alpha=args.alpha, device=args.compute_device,
             workers=args.workers,
         )
         metrics['curvature'] = _summarize_curvatures(curvature)
         prompt_records.append(metrics)
-        path = layer_dir / f"prompt_{sample_idx:05d}.pt"
+        record_ids.append(sample_idx)
         torch.save({
             "layer_id": layer_id,
             "prompt_id": sample_idx,
@@ -128,13 +151,15 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
             "attention_scores": operations['A'][0, :, 0].contiguous(),
             "curvature_scores": {"A": curvature},
             "curvature_ranking": rank_a_curvature(curvature),
+            "metrics": metrics,
         }, path)
         print(f"Saved {path}", flush=True)
         del curvature, operations
 
     if prompt_records:
         log_path = Path(args.output_dir) / "analysis" / f"layer_{layer_id:03d}_A_summary.txt"
-        write_curvature_summary(log_path, prompt_tokens, prompt_records)
+        write_curvature_summary(log_path, [prompt_tokens[i] for i in record_ids],
+                                prompt_records, prompt_ids=record_ids)
 
 
 def calculate_curvature(model, inputs, args):
@@ -151,27 +176,67 @@ def calculate_curvature(model, inputs, args):
                 torch.cuda.empty_cache()
 
 
-def main():
-    args = parse_args()
+def calculate_or_reuse(args):
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    if any(output.iterdir()):
-        raise FileExistsError(f"Use an empty output directory to keep runs separate: {output}")
 
     # CPU curvature uses multiple processes, each with one Torch thread.
     torch.set_num_threads(1)
+    configure_determinism()
     set_seed(args.seed)
     set_curvature_dtype(args.curvature_dtype)
 
-    # 1. Load model and dataset.
-    model, tokenizer = load_model(args)
-    prompts = load_dataset(args)
-    args.layer_end = len(model.model.layers) if args.layer_end is None else args.layer_end
-    if not 0 <= args.layer_start < args.layer_end <= len(model.model.layers):
+    config = AutoConfig.from_pretrained(args.model_path, cache_dir=args.cache_dir,
+                                       local_files_only=args.local_files_only,
+                                       trust_remote_code=args.trust_remote_code)
+    args.layer_end = config.num_hidden_layers if args.layer_end is None else args.layer_end
+    if not 0 <= args.layer_start < args.layer_end <= config.num_hidden_layers:
         raise ValueError("Expected 0 <= layer-start < layer-end <= model layer count")
 
+    settings_path = output / "settings.json"
+    settings = vars(args) | {"neighbor_keep_quantile": _NEIGHBOR_KEEP_QUANTILE,
+                             "curvature_algorithm_version": CURVATURE_ALGORITHM_VERSION}
+    if settings_path.exists():
+        previous = json.loads(settings_path.read_text())
+        for key in ("model_path", "tokenizer_path", "task", "num_samples", "max_length", "dtype",
+                    "curvature_dtype", "alpha", "seed", "layer_start", "layer_end", "neighbor_keep_quantile",
+                    "curvature_algorithm_version"):
+            if previous.get(key) != settings[key]:
+                raise ValueError(f"Cannot reuse curvature with changed {key}: {previous.get(key)} -> {settings[key]}. "
+                                 "Use a new output directory, or evaluate the existing scores with "
+                                 "kv_cache_experiment/evaluate_curvature.py --curvature-dir RUN_DIR.")
+    else:
+        if any(output.glob("layer_*/prompt_*.pt")):
+            raise ValueError("Saved curvature has no settings.json to verify reuse")
+
+    complete = settings_path.exists() and all(
+        (output / f"layer_{layer:03d}" / f"prompt_{prompt:05d}.pt").is_file()
+        for layer in range(args.layer_start, args.layer_end) for prompt in range(previous["prompt_count"])
+    )
+    if complete:
+        print(f"All curvature files already exist in {output}; skipping calculation.", flush=True)
+        return output
+
+    # Load weights only when at least one curvature file is missing.
+    model, tokenizer = load_model(args)
+    prompts = load_dataset(args)
+
     # 2. Capture initial hidden states; later layers collect their values on demand.
-    inputs = capture_layer_inputs(model, tokenizer, prompts, args.max_length)
+    token_ids = []
+    inputs = capture_layer_inputs(model, tokenizer, prompts, args.max_length, prompt_token_ids=token_ids)
+    manifest = {"input_ids": token_ids,
+                "prompt_sha256": [hashlib.sha256(text.encode()).hexdigest() for text in prompts]}
+    manifest_path = output / "prompts.pt"
+    if manifest_path.exists():
+        saved_manifest = torch.load(manifest_path, map_location="cpu", weights_only=True)
+        if saved_manifest["prompt_sha256"] != manifest["prompt_sha256"] or any(
+            not torch.equal(old, new) for old, new in zip(saved_manifest["input_ids"], token_ids)
+        ):
+            raise ValueError("Prompt content or tokenization changed since the saved curvature run")
+        del saved_manifest
+    else:
+        torch.save(manifest, manifest_path)
+    del manifest, token_ids
     del prompts, tokenizer
 
     settings = vars(args) | {
@@ -180,13 +245,27 @@ def main():
         "prompt_tokens": [hidden.shape[1] for hidden in inputs],
         "total_token_length": sum(hidden.shape[1] for hidden in inputs),
         "neighbor_keep_quantile": _NEIGHBOR_KEEP_QUANTILE,
+        "curvature_algorithm_version": CURVATURE_ALGORITHM_VERSION,
         "attention_edge_definition": "head_feature_sets_with_shortest_boundary_distances",
         "curvature_ranking_order": "descending",
     }
-    (output / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
+    if not settings_path.exists():
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
 
     # 3. Collect each layer's values, calculate curvature, and save the scores.
     calculate_curvature(model, inputs, args)
+    del model, inputs
+    release_cuda_memory()
+    return output
+
+
+def main():
+    args = parse_args()
+    output = calculate_or_reuse(args)
+    if args.evaluate:
+        from kv_cache_experiment.evaluate_curvature import evaluate_run
+        evaluate_run(output, methods=args.presses, compression_ratios=args.compression_ratios,
+                     device=args.device, max_new_tokens=args.max_new_tokens)
 
 
 if __name__ == "__main__":

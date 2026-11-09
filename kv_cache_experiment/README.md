@@ -2,6 +2,10 @@
 
 Compare language-model performance on LongBench with and without KV-cache compression. Each run evaluates an uncompressed baseline and the selected compression settings on the same inputs.
 
+For saved graph-curvature scores, use [the curvature comparison workflow](../graph_curvature/README.md#cache-reuse-and-compression-evaluation). `evaluate_curvature.py --curvature-dir RUN_DIR` compares curvature-min/mean, SnapKV, StreamingLLM, Knorm, and PyramidKV on the exact curvature prompts and equal total cache budgets, including an uncompressed baseline. It writes one JSON report.
+
+`graph_curvature/run.sh` exposes `RUN_CALCULATION`, `EVALUATE`, `CURVATURE_DIR`, and `EVALUATION_OUTPUT_DIR` to select calculation/comparison modes and saved runs. Both evaluation entry points share model-scaled SnapKV attention and budget-matched PyramidKV; detailed retained-token logs use PyramidKV's actual layer budget.
+
 在 LongBench 上比较语言模型使用和不使用 KV 缓存压缩时的表现。每次运行使用相同输入，评测不压缩基线及所选压缩配置。
 
 ## Setup and run / 配置与运行

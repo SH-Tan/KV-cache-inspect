@@ -10,7 +10,7 @@ class _InputCaptured(Exception):
 
 
 @torch.no_grad()
-def capture_layer_inputs(model, tokenizer, prompts, max_length=None):
+def capture_layer_inputs(model, tokenizer, prompts, max_length=None, prompt_token_ids=None):
     """Capture real first-layer inputs without running the remaining model."""
     inputs = []
 
@@ -24,6 +24,8 @@ def capture_layer_inputs(model, tokenizer, prompts, max_length=None):
         for prompt in prompts:
             tokens = tokenizer(prompt, return_tensors="pt", truncation=max_length is not None,
                                max_length=max_length)
+            if prompt_token_ids is not None:
+                prompt_token_ids.append(tokens["input_ids"][0].clone())
             tokens = tokens.to(model.model.embed_tokens.weight.device)
             try:
                 model.model(**tokens, use_cache=False)

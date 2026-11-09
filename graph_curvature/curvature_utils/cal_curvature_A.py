@@ -20,6 +20,31 @@ from .curv_tensor_utils import _get_matrix_torch, adaptive_chunksize
 
 # Fork workers inherit these read-only CPU arrays for one prompt.
 _WORKER_STATE = None
+CURVATURE_ALGORITHM_VERSION = 2
+
+
+def _transport_cost(mu, nu, cost):
+    """Solve OT on shortest-path distances; remaining infinities are unreachable pairs."""
+    if mu[-1] == 0:
+        mu, cost = mu[:-1], cost[:-1]
+    if nu[-1] == 0:
+        nu, cost = nu[:-1], cost[:, :-1]
+    finite = np.isfinite(cost)
+    if finite.all():
+        distance, log = ot.emd2(mu, nu, cost, log=True, numThreads=1)
+        return float(distance) if not log.get('warning') else np.nan
+    if not finite.any():
+        return np.nan
+
+    # A residual transport cycle has at most m+n edges. With allowed costs
+    # scaled to [0,1], m+n+1 excludes forbidden edges whenever transport is feasible.
+    scale = max(float(cost[finite].max()), 1.0)
+    bounded = np.full(cost.shape, sum(cost.shape) + 1.0, dtype=np.float64)
+    bounded[finite] = cost[finite] / scale
+    plan, log = ot.emd(mu, nu, bounded, log=True, numThreads=1)
+    if log.get('warning') or plan[~finite].sum() > 1e-12:
+        return np.nan
+    return float(np.sum(plan[finite] * cost[finite], dtype=np.float64))
 
 
 def _edge_cost_matrix_base(cost, prev_to_source, source_to_next, edge_cost):
@@ -67,10 +92,9 @@ def _compute_sequence(task):
             cost, prev_to_source[:, source_head], source_to_next[source_head], edge_cost,
         )
         if transport is None or not reuse_transport:
-            transport = ot.emd2(mu, state.nu, cost, log=True, numThreads=1)
-        distance, transport_log = transport
-        if not transport_log.get('warning') and np.isfinite(distance):
-            scores[head] = (1.0 - float(distance) / edge_cost) / (1.0 - state.alpha)
+            transport = _transport_cost(mu, state.nu, cost)
+        if np.isfinite(transport):
+            scores[head] = (1.0 - transport / edge_cost) / (1.0 - state.alpha)
 
     count = len(valid)
     return seq_idx, scores, count, count * (cost.shape[0] - 1), count * len(state.next_active)

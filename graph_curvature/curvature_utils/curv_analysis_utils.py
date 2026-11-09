@@ -47,7 +47,7 @@ def _write_metrics(stream, metrics, curvature_summary):
 
 
 def rank_a_curvature(curvature):
-    """Rank key indices per head by descending curvature; undefined entries are -1."""
+    """Rank raw curvature descending (not importance); undefined entries are -1."""
     finite = torch.isfinite(curvature)
     ranking = torch.argsort(
         curvature.masked_fill(~finite, -torch.inf), dim=-1, descending=True, stable=True,
@@ -55,7 +55,7 @@ def rank_a_curvature(curvature):
     return ranking.masked_fill(~finite.gather(-1, ranking), -1)
 
 
-def write_curvature_summary(log_path, prompt_tokens, prompt_records):
+def write_curvature_summary(log_path, prompt_tokens, prompt_records, prompt_ids=None):
     """Keep curvature summaries per prompt; pool only costs, neighbor stats, and counts."""
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,7 +67,9 @@ def write_curvature_summary(log_path, prompt_tokens, prompt_records):
         stream.write(f'prompt_count: {len(prompt_tokens)}\n')
         stream.write(f'total_token_length: {sum(prompt_tokens)}\n')
         stream.write(f'prompt_token_lengths: {prompt_tokens}\n')
-        for sample_idx, (tokens, record) in enumerate(zip(prompt_tokens, prompt_records)):
+        if prompt_ids is None:
+            prompt_ids = range(len(prompt_tokens))
+        for sample_idx, tokens, record in zip(prompt_ids, prompt_tokens, prompt_records):
             stream.write(f'\nprompt {sample_idx}:\ntoken_length: {tokens}\n')
             _write_metrics(stream, record, record['curvature'])
             for part in ('prev', 'cur', 'next'):

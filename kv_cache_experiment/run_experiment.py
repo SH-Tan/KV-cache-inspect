@@ -15,7 +15,6 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
 
-import kvpress
 import torch
 from lm_eval import simple_evaluate
 from lm_eval.models.huggingface import HFLM
@@ -24,17 +23,11 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from src.utils.cuda_memory_utils import release_cuda_memory
-from output_logging import (
+from kv_cache_experiment.comparison_utils import configure_determinism
+from kv_cache_experiment.curvature_press import SavedCurvaturePress, make_press
+from kv_cache_experiment.output_logging import (
     GenerationStats, record_compressed_prompt, write_json, write_prompt_scores, write_score_table,
 )
-
-
-def configure_determinism():
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
 
 
 def parse_args():
@@ -145,9 +138,8 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "settings.json", vars(args))
-    press_class = getattr(kvpress, args.press)
-    if press_class.forward_hook is not kvpress.BasePress.forward_hook:
-        raise ValueError("This experiment requires the BasePress prefill-only hook, e.g. SnapKVPress/KnormPress")
+    if isinstance(make_press(args.press, 0.0, **args.press_kwargs), SavedCurvaturePress):
+        raise ValueError("Use evaluate_curvature.py for saved curvature so prompt identities match")
     load_kwargs = dict(cache_dir=args.cache_dir, local_files_only=args.local_files_only,
                        trust_remote_code=args.trust_remote_code)
     
@@ -185,7 +177,7 @@ def main():
             lm.press = None
             if ratio > 0:
                 case = f"compression_{ratio}"
-                lm.press = press_class(compression_ratio=ratio, **args.press_kwargs)
+                lm.press = make_press(args.press, ratio, **args.press_kwargs)
             lm.case = case
             lm.compression_ratio = ratio
             
