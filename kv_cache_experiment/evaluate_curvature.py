@@ -22,16 +22,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from kvpress.utils import compute_n_kept
 
 from kv_cache_experiment.comparison_utils import DEFAULT_METHODS, DEFAULT_RATIOS, configure_determinism
-from kv_cache_experiment.curvature_press import SavedCurvaturePress, make_press
+from kv_cache_experiment.curvature_press import CURVATURE_SCORE_METHODS, SavedCurvaturePress, make_press
 from kv_cache_experiment.output_logging import write_json
 from src.utils.cuda_memory_utils import release_cuda_memory
 
 
-def load_prompt_tokens(run_dir, settings, task, tokenizer):
+def load_prompt_tokens(run_dir, settings, task, tokenizer, online=False):
     """Use the first N documents, exactly as the curvature collector does."""
-    prompts = [task.doc_to_text(doc) for doc in islice(task.test_docs(), settings["prompt_count"])]
+    count = settings["num_samples"] if online else settings["prompt_count"]
+    prompts = [task.doc_to_text(doc) for doc in islice(task.test_docs(), count)]
     path = run_dir / "prompts.pt"
-    if path.exists():
+    if not online and path.exists():
         manifest = torch.load(path, map_location="cpu", weights_only=True)
         hashes = [hashlib.sha256(text.encode()).hexdigest() for text in prompts]
         if hashes != manifest["prompt_sha256"]:
@@ -41,8 +42,8 @@ def load_prompt_tokens(run_dir, settings, task, tokenizer):
         # Legacy runs did not save token IDs. Reconstruct from their recorded settings.
         tokens = [tokenizer(text, return_tensors="pt", truncation=settings["max_length"] is not None,
                             max_length=settings["max_length"])["input_ids"][0] for text in prompts]
-        identity = "legacy_reconstructed_from_task_and_run_settings"
-    if [ids.numel() for ids in tokens] != settings["prompt_tokens"]:
+        identity = "online_tokenized_input_ids" if online else "legacy_reconstructed_from_task_and_run_settings"
+    if not online and [ids.numel() for ids in tokens] != settings["prompt_tokens"]:
         raise ValueError("Tokenized prompts do not match the saved curvature token counts")
     return prompts, tokens, identity
 
@@ -56,7 +57,7 @@ class CurvatureComparisonLM(HFLM):
         self.prompts, self.prompt_tokens, self.seed = prompts, prompt_tokens, seed
         self.press = None
         self.prompt_id = 0
-        self.observed = {}
+        self.curvature_provider = None
 
     def generate_until(self, requests, disable_tqdm=False):
         answers = []
@@ -64,10 +65,12 @@ class CurvatureComparisonLM(HFLM):
             self.prompt_id = request.doc_id
             if request.args[0] != self.prompts[self.prompt_id]:
                 raise ValueError("Evaluation changed the prompt text used for curvature")
-            if isinstance(self.press, SavedCurvaturePress):
-                self.press.prompt_id = self.prompt_id
+            scorer = getattr(self.press, "curvature_scorer", self.press)
+            if isinstance(scorer, SavedCurvaturePress):
+                scorer.prompt_id = self.prompt_id
+            if self.curvature_provider is not None:
+                self.curvature_provider.prompt_id = self.prompt_id
             answer = super().generate_until([request], disable_tqdm=True)[0]
-            self.observed[self.prompt_id]["prediction"] = answer
             answers.append(answer)
         return answers
 
@@ -89,7 +92,6 @@ class CurvatureComparisonLM(HFLM):
             if observed:
                 return
             layers = output.past_key_values.layers
-            lengths = [layer.keys.shape[-2] for layer in layers]
             # PyramidKV varies layer sizes; total elements must still match exactly.
             actual_elements = sum(layer.keys.numel() + layer.values.numel() for layer in layers)
             expected_elements = sum(
@@ -98,15 +100,13 @@ class CurvatureComparisonLM(HFLM):
             )
             if actual_elements != expected_elements:
                 raise ValueError(f"Unequal KV budget: expected {expected_elements}, got {actual_elements} elements")
-            self.observed[self.prompt_id] = {
-                "prompt_id": self.prompt_id, "prompt_tokens": prompt_length,
-                "kept_tokens_per_layer": lengths, "prefill_kv_elements": actual_elements,
-                "actual_removal_ratio": 1 - sum(lengths) / (len(layers) * prompt_length),
-            }
             observed = True
 
         compression = self.press(self.model) if self.press is not None else nullcontext()
-        with torch.no_grad(), compression, self.model.register_forward_hook(record_cache):
+        needs_curvature = isinstance(self.press, SavedCurvaturePress) or hasattr(self.press, "curvature_scorer")
+        capture = (self.curvature_provider.capture(prompt_length)
+                   if self.curvature_provider is not None and needs_curvature else nullcontext())
+        with torch.no_grad(), capture, compression, self.model.register_forward_hook(record_cache):
             generated = super()._model_generate(
                 context, max_length, stop, logits_to_keep=1, output_scores=False,
                 return_dict_in_generate=False, **kwargs,
@@ -117,9 +117,27 @@ class CurvatureComparisonLM(HFLM):
 
 
 def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFAULT_RATIOS,
-                 device="cuda:0", max_new_tokens=None, output_dir=None):
+                 device="cuda:0", max_new_tokens=None, output_dir=None, *, online_settings=None,
+                 score_source="native", curvature_reduction="mean"):
     run_dir = Path(curvature_dir)
-    settings = json.loads((run_dir / "settings.json").read_text())
+    online = online_settings is not None
+    if online:
+        from graph_curvature.curvature_utils.cal_curvature_A import CURVATURE_ALGORITHM_VERSION
+        from graph_curvature.curvature_utils.curv_distribution_utils import _NEIGHBOR_KEEP_QUANTILE
+        from graph_curvature.curvature_utils.curv_dtype_utils import set_curvature_dtype
+        from graph_curvature.online_curvature import OnlineCurvature
+        if (run_dir / "settings.json").exists():
+            raise ValueError("Online calculation requires a new OUTPUT_DIR; use saved-log evaluation to reuse a run")
+        settings = dict(online_settings) | {
+            "neighbor_keep_quantile": _NEIGHBOR_KEEP_QUANTILE,
+            "curvature_algorithm_version": CURVATURE_ALGORITHM_VERSION,
+            "attention_edge_definition": "head_feature_sets_with_shortest_boundary_distances",
+            "curvature_ranking_order": "descending",
+        }
+        set_curvature_dtype(settings["curvature_dtype"])
+        torch.set_num_threads(1)
+    else:
+        settings = json.loads((run_dir / "settings.json").read_text())
     configure_determinism()
     methods = list(dict.fromkeys(method.strip() for method in methods.split(",")))
     ratios = sorted(set(float(value) for value in compression_ratios.split(",")))
@@ -127,11 +145,12 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
         raise ValueError("Compression ratios must be in (0, 1); baseline is evaluated separately")
     if settings["layer_start"] != 0:
         raise ValueError("Comparison requires saved curvature for every model layer")
-    for layer in range(settings["layer_end"]):
-        for prompt in range(settings["prompt_count"]):
-            path = run_dir / f"layer_{layer:03d}" / f"prompt_{prompt:05d}.pt"
-            if not path.is_file():
-                raise FileNotFoundError(f"Missing curvature file: {path}")
+    if not online:
+        for layer in range(settings["layer_end"]):
+            for prompt in range(settings["prompt_count"]):
+                path = run_dir / f"layer_{layer:03d}" / f"prompt_{prompt:05d}.pt"
+                if not path.is_file():
+                    raise FileNotFoundError(f"Missing curvature file: {path}")
     options = dict(cache_dir=settings["cache_dir"], local_files_only=settings["local_files_only"],
                    trust_remote_code=settings["trust_remote_code"])
     tokenizer = AutoTokenizer.from_pretrained(settings["tokenizer_path"] or settings["model_path"], **options)
@@ -139,49 +158,79 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
         settings["model_path"], dtype=settings["dtype"], device_map=device,
         attn_implementation="sdpa", low_cpu_mem_usage=True, **options,
     ).eval()
+    if online and settings["layer_end"] is None:
+        settings["layer_end"] = model.config.num_hidden_layers
     if settings["layer_end"] != model.config.num_hidden_layers:
         raise ValueError("Comparison requires saved curvature for every model layer")
     manager = TaskManager()
     task = manager.load([settings["task"]])["tasks"][settings["task"]]
-    prompts, tokens, identity = load_prompt_tokens(run_dir, settings, task, tokenizer)
+    prompts, tokens, identity = load_prompt_tokens(run_dir, settings, task, tokenizer, online=online)
+    if online:
+        settings.update(prompt_count=len(prompts), prompt_tokens=[ids.numel() for ids in tokens],
+                        total_token_length=sum(ids.numel() for ids in tokens), resolved_model_dtype=str(model.dtype))
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_json(run_dir / "settings.json", settings)
+        if settings["save_curvature"]:
+            torch.save({"input_ids": tokens,
+                        "prompt_sha256": [hashlib.sha256(text.encode()).hexdigest() for text in prompts]},
+                       run_dir / "prompts.pt")
     lm = CurvatureComparisonLM(model, tokenizer, prompts, tokens, settings["seed"])
+    if online:
+        lm.curvature_provider = OnlineCurvature(model, settings, run_dir)
+    prompt_ids = list(range(len(prompts)))
     report = {
         "curvature_dir": str(run_dir.resolve()), "model": settings["model_path"],
-        "task": settings["task"], "prompt_ids": list(range(len(prompts))),
+        "task": settings["task"], "prompt_count": len(prompts),
+        "prompt_selection": "first N test documents in dataset order",
         "prompt_identity": identity, "seed": settings["seed"],
+        "tokenizer": settings["tokenizer_path"] or settings["model_path"],
+        "dtype": settings.get("resolved_model_dtype", settings["dtype"]),
+        "max_length": settings["max_length"],
+        "curvature_files": "layer_{layer:03d}/prompt_{prompt:05d}.pt",
+        "alpha": settings["alpha"],
+        "curvature_dtype": settings["curvature_dtype"],
+        "layer_start": settings["layer_start"], "layer_end": settings["layer_end"],
+        "attention_edge_definition": settings.get("attention_edge_definition"),
         "neighbor_keep_quantile": settings["neighbor_keep_quantile"],
         "curvature_algorithm_version": settings.get("curvature_algorithm_version", 1),
         "window_attention_scaling": "model.scaling for SnapKV and PyramidKV",
-        "methods": methods, "compression_ratios": ratios,
         "compression_scope": "prefill_only; generated tokens are retained",
         "curvature_reduction": "min/mean across all query heads; same token scores for each KV head",
-        "curvature_removal_order": "highest reduced raw curvature first; retain lowest curvature",
+        "curvature_removal_order": "negative reduced curvature is importance; variants then apply pooling/window or sink/value-norm policies",
         "budget": "equal total prefill KV elements; PyramidKV rounding matched to uniform budget",
         "generation": {"do_sample": False, "max_gen_toks": max_new_tokens or task.config.generation_kwargs["max_gen_toks"]},
-        "cases": [],
+        "accuracy_metric": "LongBench task score (code similarity for LCC)",
+        "accuracy_scale": "0-1",
+        "online_compression": online,
+        "save_curvature": bool(settings.get("save_curvature", True)),
+        "score_source": score_source, "curvature_score_reduction": curvature_reduction,
+        "curvature_score_methods": [method for method in methods
+                                    if score_source == "curvature" and method in CURVATURE_SCORE_METHODS],
+        "curvature_query": "last prompt query; curvature variants do not estimate attention for other queries",
+        "curvature_attention_replacement": "SnapKV/PyramidKV pool negative curvature; ExpectedAttention applies softmax before value-norm scaling",
     }
+    report = {"settings": report, "cases": []}
     output = Path(output_dir) if output_dir is not None else run_dir / "evaluation"
     output.mkdir(parents=True, exist_ok=True)
     cases = [("baseline", 0.0)] + [(method, ratio) for ratio in ratios for method in methods]
     for method, ratio in cases:
-        lm.press = None if method == "baseline" else make_press(method, ratio, run_dir)
-        lm.observed = {}
+        lm.press = None if method == "baseline" else make_press(
+            method, ratio, run_dir, score_source=score_source, curvature_reduction=curvature_reduction,
+            curvature_provider=lm.curvature_provider,
+        )
         generation = dict(do_sample=False, temperature=0.0)
         if max_new_tokens is not None:
             generation["max_gen_toks"] = max_new_tokens
         results = simple_evaluate(
             model=lm, tasks=[task], task_manager=manager, num_fewshot=0, batch_size=1,
-            samples={settings["task"]: report["prompt_ids"]}, gen_kwargs=generation,
+            samples={settings["task"]: prompt_ids}, gen_kwargs=generation,
             apply_chat_template=False, bootstrap_iters=0, log_samples=False,
             random_seed=settings["seed"], numpy_random_seed=settings["seed"],
             torch_random_seed=settings["seed"], fewshot_random_seed=settings["seed"],
         )
-        for request in task.instances:
-            lm.observed[request.doc_id]["scores"] = task.process_results(request.doc, [request.filtered_resps["none"]])
-            lm.observed[request.doc_id]["reference_answers"] = request.doc["answers"]
         metrics = results["results"][settings["task"]]
-        report["cases"].append({"method": method, "removal_ratio": ratio, "metrics": metrics,
-                                "prompts": [lm.observed[key] for key in sorted(lm.observed)]})
+        report["cases"].append({"method": method, "removal_ratio": ratio,
+                                "accuracy": metrics["score,none"]})
         write_json(output / "comparison.json", report)
         print(f"{method:20s} removal={ratio:.2f} score={metrics['score,none'] * 100:.4f}", flush=True)
         release_cuda_memory()
@@ -196,6 +245,8 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--score-source", choices=("native", "curvature"), default="native")
+    parser.add_argument("--curvature-reduction", choices=("min", "mean"), default="mean")
     args = parser.parse_args()
     evaluate_run(**vars(args))
 

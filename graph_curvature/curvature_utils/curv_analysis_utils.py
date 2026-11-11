@@ -55,6 +55,20 @@ def rank_a_curvature(curvature):
     return ranking.masked_fill(~finite.gather(-1, ranking), -1)
 
 
+def save_a_curvature(path, layer_id, prompt_id, operations, curvature, metrics):
+    """Write the same score format from offline calculation and online prefill."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token_count = operations['layer_input'].shape[1]
+    torch.save({
+        "layer_id": layer_id, "prompt_id": prompt_id,
+        "token_count": token_count, "query_index": token_count - 1,
+        "attention_scores": operations['A'][0, :, 0].contiguous(),
+        "curvature_scores": {"A": curvature},
+        "curvature_ranking": rank_a_curvature(curvature), "metrics": metrics,
+    }, path)
+
+
 def write_curvature_summary(log_path, prompt_tokens, prompt_records, prompt_ids=None):
     """Keep curvature summaries per prompt; pool only costs, neighbor stats, and counts."""
     log_path = Path(log_path)

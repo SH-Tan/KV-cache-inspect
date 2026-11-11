@@ -19,7 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, set_se
 
 from graph_curvature.curvature_utils.cal_curvature_A import CURVATURE_ALGORITHM_VERSION, compute_a_curvature
 from graph_curvature.curvature_utils.curv_analysis_utils import (
-    _summarize_curvatures, rank_a_curvature, write_curvature_summary,
+    _summarize_curvatures, save_a_curvature, write_curvature_summary,
 )
 from graph_curvature.curvature_utils.curv_distribution_utils import _NEIGHBOR_KEEP_QUANTILE
 from graph_curvature.curvature_utils.curv_dtype_utils import (
@@ -61,6 +61,11 @@ def parse_args():
     parser.add_argument("--presses", default=DEFAULT_METHODS)
     parser.add_argument("--compression-ratios", default=DEFAULT_RATIOS)
     parser.add_argument("--max-new-tokens", type=int, help="Evaluation generation cap; defaults to the task setting")
+    parser.add_argument("--online-compression", action="store_true", help="Calculate and compress during prefill, then decode and score")
+    parser.add_argument("--save-curvature", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--score-source", choices=("native", "curvature"), default="native")
+    parser.add_argument("--curvature-reduction", choices=("min", "mean"), default="mean")
+    parser.add_argument("--evaluation-output-dir")
 
     args = parser.parse_args()
 
@@ -72,6 +77,8 @@ def parse_args():
         parser.error("--alpha must be in [0, 1)")
     if args.max_length is not None and args.max_length < 1:
         parser.error("--max-length must be positive")
+    if args.evaluate and not args.online_compression and not args.save_curvature:
+        parser.error("Offline evaluation requires --save-curvature 1; use --online-compression otherwise")
 
     return args
 
@@ -105,7 +112,7 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
     calculate = layer_id >= args.layer_start
     layer_cache = None
     layer_dir = Path(args.output_dir) / f"layer_{layer_id:03d}"
-    if calculate:
+    if calculate and args.save_curvature:
         layer_dir.mkdir(parents=True, exist_ok=True)
     prompt_records = []
     record_ids = []
@@ -124,7 +131,7 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
             continue
 
         path = layer_dir / f"prompt_{sample_idx:05d}.pt"
-        if path.exists():
+        if args.save_curvature and path.exists():
             saved = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
             if saved['token_count'] != hidden.shape[1]:
                 raise ValueError(f"Saved curvature prompt length changed: {path}")
@@ -143,17 +150,9 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
         metrics['curvature'] = _summarize_curvatures(curvature)
         prompt_records.append(metrics)
         record_ids.append(sample_idx)
-        torch.save({
-            "layer_id": layer_id,
-            "prompt_id": sample_idx,
-            "token_count": hidden.shape[1],
-            "query_index": hidden.shape[1] - 1,
-            "attention_scores": operations['A'][0, :, 0].contiguous(),
-            "curvature_scores": {"A": curvature},
-            "curvature_ranking": rank_a_curvature(curvature),
-            "metrics": metrics,
-        }, path)
-        print(f"Saved {path}", flush=True)
+        if args.save_curvature:
+            save_a_curvature(path, layer_id, sample_idx, operations, curvature, metrics)
+            print(f"Saved {path}", flush=True)
         del curvature, operations
 
     if prompt_records:
@@ -209,7 +208,7 @@ def calculate_or_reuse(args):
         if any(output.glob("layer_*/prompt_*.pt")):
             raise ValueError("Saved curvature has no settings.json to verify reuse")
 
-    complete = settings_path.exists() and all(
+    complete = args.save_curvature and settings_path.exists() and all(
         (output / f"layer_{layer:03d}" / f"prompt_{prompt:05d}.pt").is_file()
         for layer in range(args.layer_start, args.layer_end) for prompt in range(previous["prompt_count"])
     )
@@ -234,7 +233,7 @@ def calculate_or_reuse(args):
         ):
             raise ValueError("Prompt content or tokenization changed since the saved curvature run")
         del saved_manifest
-    else:
+    elif args.save_curvature:
         torch.save(manifest, manifest_path)
     del manifest, token_ids
     del prompts, tokenizer
@@ -261,11 +260,20 @@ def calculate_or_reuse(args):
 
 def main():
     args = parse_args()
+    if args.online_compression:
+        from kv_cache_experiment.evaluate_curvature import evaluate_run
+        evaluate_run(args.output_dir, methods=args.presses, compression_ratios=args.compression_ratios,
+                     device=args.device, max_new_tokens=args.max_new_tokens,
+                     output_dir=args.evaluation_output_dir, online_settings=vars(args),
+                     score_source=args.score_source, curvature_reduction=args.curvature_reduction)
+        return
     output = calculate_or_reuse(args)
     if args.evaluate:
         from kv_cache_experiment.evaluate_curvature import evaluate_run
         evaluate_run(output, methods=args.presses, compression_ratios=args.compression_ratios,
-                     device=args.device, max_new_tokens=args.max_new_tokens)
+                     device=args.device, max_new_tokens=args.max_new_tokens,
+                     output_dir=args.evaluation_output_dir, score_source=args.score_source,
+                     curvature_reduction=args.curvature_reduction)
 
 
 if __name__ == "__main__":

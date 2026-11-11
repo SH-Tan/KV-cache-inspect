@@ -18,22 +18,36 @@ PYTHON_BIN=python MODEL_PATH="<model-id-or-path>" bash graph_curvature/run.sh
 
 ## Cache reuse and compression evaluation
 
-All workflow controls are in `run.sh` and accept environment overrides:
+`run.sh` calculates/saves curvature and evaluates it in separate processes. `run_online.sh` calculates curvature during prefill, compresses, then decodes and scores. Each launcher has its own editable settings and accepts environment overrides; neither sources or dispatches to the other:
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `RUN_CALCULATION` | Calculate or resume curvature (`1`), or skip calculation (`0`) | `1` |
+| `RUN_CALCULATION` | Calculate or resume offline curvature (`1`), or skip that stage (`0`); offline launcher only | `0` |
 | `EVALUATE` | Run compression and accuracy comparison (`1`), or skip it (`0`) | `1` |
-| `OUTPUT_DIR` | Directory for calculated curvature | New timestamped directory |
+| `TASKS` | Comma-separated datasets, processed sequentially; `TASK` still selects one dataset | `longbench_lcc` |
+| `SAVE_CURVATURE` | Write curvature `.pt` files and prompt-token manifest (`1`), or keep curvature transient (`0`) | Offline: `1`; online: `0` |
+| `SCORE_SOURCE` | Use original method scores (`native`), or curvature scoring for SnapKV/PyramidKV/ExpectedAttention (`curvature`) | `curvature` |
+| `CURVATURE_REDUCTION` | Reduce query heads with `min` or `mean` for those three variants; `curvature_min`/`curvature_mean` retain their named reduction | `mean` |
+| `OUTPUT_DIR` | Run root; multiple datasets get separate `OUTPUT_DIR/<task>` directories | New timestamped directory |
 | `CURVATURE_DIR` | Saved run directory used for comparison; contains `settings.json` and layer `.pt` files | `OUTPUT_DIR` |
-| `EVALUATION_OUTPUT_DIR` | Destination for `comparison.json` | `CURVATURE_DIR/evaluation` |
+| `EVALUATION_OUTPUT_DIR` | Optional evaluation root; multiple datasets get separate `<task>` subdirectories | Each task's run directory plus `/evaluation` |
 
-Calculation and comparison run in separate processes to release calculation memory before inference. Specify a stable `OUTPUT_DIR` to resume a calculation; the default timestamp creates a new directory each launch. A complete score set skips loading the calculation model. Partial runs still propagate hidden states through the layers, but skip OT and projection-cost construction wherever scores already exist. Calculation settings, neighbor quantile, and algorithm version must match the saved run.
+Both launchers default to LCC with 50 samples. Qasper and TREC remain optional shorter datasets. Complete rendered prompts measured with the cached Granite 3.3 2B tokenizer (no truncation) have these mean token lengths:
+
+| Dataset | Full test set | First 50 prompts |
+| --- | ---: | ---: |
+| LCC | 3,629 | 3,657 |
+| Qasper | 5,729 | 6,191 |
+| TREC | 8,055 | 7,487 |
+
+These are shorter cached options than HotpotQA (16,276 tokens on average); individual prompts can still be longer. Override with `TASK=longbench_lcc` or `TASKS=longbench_lcc,longbench_qasper`. A single dataset keeps the original flat output layout. For a legacy saved directory containing `settings.json`, `RUN_CALCULATION=0 CURVATURE_DIR=... bash graph_curvature/run.sh` evaluates that one recorded dataset directly.
+
+Offline calculation and comparison run in separate processes to release calculation memory before inference. By default, `run.sh` evaluates the saved LCC curvature in `logs/graph_curvature/20261108_131908`. Set `RUN_CALCULATION=1` to calculate, save, and evaluate a fresh run; use the same `OUTPUT_DIR` and settings to resume it. A complete score set skips loading the calculation model. Partial runs still propagate hidden states through the layers, but skip OT and projection-cost construction wherever scores already exist. Calculation settings, neighbor quantile, and algorithm version must match the saved run.
 
 ```bash
-OUTPUT_DIR=logs/graph_curvature/my_quantile70_run NUM_SAMPLES=50 bash graph_curvature/run.sh
+RUN_CALCULATION=1 OUTPUT_DIR=logs/graph_curvature/my_quantile70_run NUM_SAMPLES=50 bash graph_curvature/run.sh
 # Resume the same calculation and evaluate on exactly those prompts:
-OUTPUT_DIR=logs/graph_curvature/my_quantile70_run NUM_SAMPLES=50 bash graph_curvature/run.sh
+RUN_CALCULATION=1 OUTPUT_DIR=logs/graph_curvature/my_quantile70_run NUM_SAMPLES=50 bash graph_curvature/run.sh
 ```
 
 To compare an existing score directory using the shell controls:
@@ -49,21 +63,39 @@ bash graph_curvature/run.sh
 
 That legacy run contains **0.9-quantile, algorithm-version-1** curvature. New calculations use **0.7, version 2**. Comparison-only mode can evaluate older runs and records their original quantile/version. Resuming calculation requires matching versions so corrected OT results are not mixed with older files.
 
-The default comparison is an uncompressed baseline plus `curvature_min`, `curvature_mean`, `SnapKVPress`, `StreamingLLMPress`, `KnormPress`, and `PyramidKVPress`, at removal ratios `0.3,0.5,0.7,0.9`. Configure `PRESSES`, `COMPRESSION_RATIOS`, and optional `MAX_NEW_TOKENS` in the launcher, or `--methods`, `--compression-ratios`, and `--max-new-tokens` in the standalone evaluator. Generation is greedy, with the saved seed and the task's generation cap unless overridden.
+The launcher comparison is an uncompressed baseline plus `curvature_min`, `curvature_mean`, `SnapKVPress`, `ExpectedAttentionPress`, and `PyramidKVPress`, at removal ratios `0.3,0.5,0.7,0.9`. Configure `PRESSES`, `COMPRESSION_RATIOS`, and optional `MAX_NEW_TOKENS` in the launcher, or `--methods`, `--compression-ratios`, and `--max-new-tokens` in the standalone evaluator. Generation is greedy, with the saved seed and the task's generation cap unless overridden.
 
-Compression **removes the highest raw-curvature tokens first** and retains the lowest-curvature tokens. After taking minimum or finite-only mean across query heads for each token, kvpress receives the negative of that reduced curvature because its top-k operation selects tokens to keep. The same token scores are shared by all KV heads without copying them. The stored per-head descending `curvature_ranking` is not used for the cross-head reduction. Each layer's score file is memory-mapped on CPU when needed; full model attention matrices are not retained.
+For online calculation without saving `.pt` files:
+
+```bash
+TASK=longbench_lcc PRESSES=curvature_mean COMPRESSION_RATIOS=0.5 \
+bash graph_curvature/run_online.sh
+# Replace attention scoring in SnapKV/PyramidKV/ExpectedAttention, online:
+SCORE_SOURCE=curvature PRESSES=SnapKVPress,PyramidKVPress,ExpectedAttentionPress \
+bash graph_curvature/run_online.sh
+# The same variants using an existing saved log, with no new curvature calculation:
+RUN_CALCULATION=0 CURVATURE_DIR=logs/graph_curvature/20261108_131908 \
+SCORE_SOURCE=curvature PRESSES=SnapKVPress,PyramidKVPress,ExpectedAttentionPress \
+bash graph_curvature/run.sh
+```
+
+Online mode computes curvature from the actual normalized layer input, native uncompressed V cache, last-query attention using the model's scale, and actual O-projection output. It immediately compresses that layer's prefill cache, then continues the forward pass and decoding. Only the current layer's curvature operations/projection costs are retained, and decoding does not calculate curvature. Each method/rate runs its own prefill and recomputes its curvature; use a smaller `PRESSES`/`COMPRESSION_RATIOS` selection to avoid repeating expensive OT. `SAVE_CURVATURE=1` uses the same score format as offline calculation so the resulting run can later be evaluated from disk. Online mode requires a fresh output directory and `EVALUATE=1`. Offline calculation with `SAVE_CURVATURE=0` requires `EVALUATE=0`.
+
+Curvature variants use **only the last prompt query's curvature**, not SnapKV's original multi-query attention estimate. The SnapKV variant uses finite-only pooling and retains priority for recent window tokens; PyramidKV also keeps its layer allocation and exact total KV budget. ExpectedAttention replaces its statistical attention predictor with softmax of negative reduced curvature, retaining its optional value-norm scaling and sink-token priority. StreamingLLM's position policy and Knorm's key norms do not use attention scores and remain unchanged. These are curvature variants of the methods, not their original attention algorithms; `comparison.json` records the score source, head reduction, and affected methods once.
+
+The direct `curvature_min` and `curvature_mean` methods **remove the highest raw-curvature tokens first** and retain the lowest-curvature tokens. After taking minimum or finite-only mean across query heads for each token, kvpress receives the negative of that reduced curvature because its top-k operation selects tokens to keep. The same token scores are shared by all KV heads without copying them. The stored per-head descending `curvature_ranking` is not used for the cross-head reduction. Each layer's score file is memory-mapped on CPU when needed; full model attention matrices are not retained.
 
 Every method uses the same first N task documents and exact prompt token IDs. New runs save one `prompts.pt` containing input IDs and prompt-text hashes. Legacy runs reconstruct tokenization from their saved task/settings and check token counts; exact identity assumes the cached dataset and tokenizer are unchanged. Prompts are never silently truncated for evaluation: the saved prompt plus generation must fit the model context.
 
 Compression happens once after prefill. All methods retain exactly the same **total number of KV elements** at a given rate; the evaluator verifies the physical cache. PyramidKV keeps its varying, nonincreasing layer allocation, with integer rounding adjusted to match that total. SnapKV and PyramidKV reconstruct window attention using the model's actual attention scale, including Granite's configured multiplier. Generated tokens subsequently grow the cache normally.
 
-One `evaluation/comparison.json` stores settings, task metrics, per-prompt predictions/references, and measured cache sizes. Scores are LongBench task metrics, such as code similarity for LCC, rather than a universal accuracy measure. No CSV or PDF copies are generated. Per-prompt metrics stored in new score files preserve complete summaries when calculation resumes.
+One `evaluation/comparison.json` stores shared data, seed, saved `.pt` location, curvature, and generation settings once. Each case contains only `method`, `removal_ratio`, and `accuracy` on a 0–1 scale. Scores are LongBench task metrics, such as code similarity for LCC, rather than a universal accuracy measure. Physical cache budgets are still verified during inference. No CSV or PDF copies are generated. Per-prompt metrics stored in new score files preserve complete summaries when calculation resumes.
 
 The A40 host has 48 physical CPU cores / 96 logical CPUs. Both entry points default to 48 CPU workers, capped by active key tokens. Each worker builds one token's path blocks and solves OT locally, sharing inherited read-only inputs through `fork`. Queues carry token indices and compact results. Torch and OT use one thread per worker; the launcher also defaults OpenMP/BLAS to one thread. `WORKERS=1` / `--workers 1` uses serial execution.
 
 A40 主机有 48 个物理 CPU 核心、96 个逻辑 CPU，默认使用 48 个 CPU worker，实际数量不超过有效 key token 数。worker 通过 `fork` 共享只读输入，在进程内计算路径和 OT；队列仅传递 token 索引和紧凑结果。Torch、OT 每个 worker 使用单线程，启动脚本中 OpenMP/BLAS 默认也为单线程。设置 `WORKERS=1` / `--workers 1` 使用串行计算。
 
-Model layers run one at a time on `DEVICE=cuda:0`; path calculation defaults to `COMPUTE_DEVICE=cpu`. CUDA path calculation, when selected, runs in the parent process; workers solve CPU OT. Curvature defaults to `float32`; use `CURVATURE_DTYPE=float64` / `--curvature-dtype float64` for higher precision. `alpha` defaults to `0.0` in both the launcher and Python CLI. `settings.json` records the value used.
+Offline calculation moves model layers one at a time onto `DEVICE=cuda:0`; online compression uses the evaluator's inference model. Path calculation defaults to `COMPUTE_DEVICE=cpu`. CUDA path calculation, when selected, runs in the parent process; workers solve CPU OT. Curvature defaults to `float32`; use `CURVATURE_DTYPE=float64` / `--curvature-dtype float64` for higher precision. `alpha` defaults to `0.0` in both the launcher and Python CLI. `settings.json` records the value used.
 
 ## Graph and transport definition / 图和传输定义
 
