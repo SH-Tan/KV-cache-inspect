@@ -28,6 +28,7 @@ PYTHON_BIN=python MODEL_PATH="<model-id-or-path>" bash graph_curvature/run.sh
 | `SAVE_CURVATURE` | Write curvature `.pt` files and prompt-token manifest (`1`), or keep curvature transient (`0`) | Offline: `1`; online: `0` |
 | `SCORE_SOURCE` | Use original method scores (`native`), or curvature scoring for SnapKV/PyramidKV/ExpectedAttention (`curvature`) | `curvature` |
 | `CURVATURE_REDUCTION` | Reduce query heads with `min` or `mean` for those three variants; `curvature_min`/`curvature_mean` retain their named reduction | `mean` |
+| `CURVATURE_RANKING` | Rank direct `curvature_min`/`curvature_mean` scores per `layer`, or across the full `model` | `layer` |
 | `OUTPUT_DIR` | Run root; multiple datasets get separate `OUTPUT_DIR/<task>` directories | New timestamped directory |
 | `CURVATURE_DIR` | Saved run directory used for comparison; contains `settings.json` and layer `.pt` files | `OUTPUT_DIR` |
 | `EVALUATION_OUTPUT_DIR` | Optional evaluation root; multiple datasets get separate `<task>` subdirectories | Each task's run directory plus `/evaluation` |
@@ -84,6 +85,15 @@ Online mode computes curvature from the actual normalized layer input, native un
 Curvature variants use **only the last prompt query's curvature**, not SnapKV's original multi-query attention estimate. The SnapKV variant uses finite-only pooling and retains priority for recent window tokens; PyramidKV also keeps its layer allocation and exact total KV budget. ExpectedAttention replaces its statistical attention predictor with softmax of negative reduced curvature, retaining its optional value-norm scaling and sink-token priority. StreamingLLM's position policy and Knorm's key norms do not use attention scores and remain unchanged. These are curvature variants of the methods, not their original attention algorithms; `comparison.json` records the score source, head reduction, and affected methods once.
 
 The direct `curvature_min` and `curvature_mean` methods **remove the highest raw-curvature tokens first** and retain the lowest-curvature tokens. After taking minimum or finite-only mean across query heads for each token, kvpress receives the negative of that reduced curvature because its top-k operation selects tokens to keep. The same token scores are shared by all KV heads without copying them. The stored per-head descending `curvature_ranking` is not used for the cross-head reduction. Each layer's score file is memory-mapped on CPU when needed; full model attention matrices are not retained.
+
+Set `CURVATURE_RANKING=model` (CLI: `--curvature-ranking model`) to rank those reduced scores jointly over all layers for each prompt. Layers can retain different numbers of tokens, including zero. The total retained budget remains `num_layers * max(1, int(prompt_length * (1 - removal_ratio)))`, matching the existing comparison methods and integer rounding. No minimum is imposed on individual layers. Equal scores prefer earlier layers, then earlier tokens; undefined scores have lowest retention priority. The default `layer` mode and the allocation/pooling/window/sink policies of other methods, including curvature-scored variants, remain unchanged. `comparison.json` records the ranking mode and the direct methods it applies to.
+
+```bash
+CURVATURE_RANKING=model PRESSES=curvature_min,curvature_mean \
+bash graph_curvature/run_eval.sh
+```
+
+Full-model ranking retains only one CPU score per layer/token while ranking. Saved-score evaluation builds the selection before compressing the first layer and still compresses caches as each layer finishes. Online evaluation computes each layer's curvature once, waits for the final layer's scores, then compresses all caches before decoding; its peak prefill memory therefore includes the full uncompressed KV cache. It does not copy full caches or retain full-model curvature operations. Generated tokens remain uncompressed in both modes.
 
 Every method uses the same first N task documents and exact prompt token IDs. New runs save one `prompts.pt` containing input IDs and prompt-text hashes. Legacy runs reconstruct tokenization from their saved task/settings and check token counts; exact identity assumes the cached dataset and tokenizer are unchanged. Prompts are never silently truncated for evaluation: the saved prompt plus generation must fit the model context.
 

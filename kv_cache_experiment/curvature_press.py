@@ -10,6 +10,7 @@ from torch.nn import functional as F
 import kvpress
 from kvpress import PyramidKVPress, ScorerPress, SnapKVPress
 from kvpress.utils import compute_n_kept, get_query_states
+from transformers import QuantizedCache
 from transformers.models.llama.modeling_llama import repeat_kv
 
 
@@ -44,15 +45,22 @@ class SavedCurvaturePress(ScorerPress):
     prompt_id: int = 0
     curvature_provider: object = None
 
+    def load_curvature(self, layer_idx, length):
+        path = Path(self.curvature_dir) / f"layer_{layer_idx:03d}" / f"prompt_{self.prompt_id:05d}.pt"
+        record = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if record["token_count"] != length or record["query_index"] != length - 1:
+            raise ValueError(f"Saved curvature does not match the inference prompt length: {path}")
+        return record["curvature_scores"]["A"]
+
     def score(self, module, hidden_states, keys, values, attentions, kwargs):
         if self.curvature_provider is not None:
             curvature = self.curvature_provider(module, hidden_states, keys, values, attentions, kwargs)
         else:
-            path = Path(self.curvature_dir) / f"layer_{module.layer_idx:03d}" / f"prompt_{self.prompt_id:05d}.pt"
-            record = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-            if record["token_count"] != keys.shape[2] or record["query_index"] != keys.shape[2] - 1:
-                raise ValueError(f"Saved curvature does not match the inference prompt length: {path}")
-            curvature = record["curvature_scores"]["A"]
+            curvature = self.load_curvature(module.layer_idx, keys.shape[2])
+        importance = self.reduce_curvature(curvature)
+        return importance.to(keys.device).view(1, 1, -1).expand(keys.shape[:3])
+
+    def reduce_curvature(self, curvature):
         finite = torch.isfinite(curvature)
         if self.reduction == "min":
             reduced = curvature.masked_fill(~finite, torch.inf).amin(dim=0)
@@ -62,8 +70,57 @@ class SavedCurvaturePress(ScorerPress):
             raise ValueError(f"Unknown curvature reduction: {self.reduction}")
         # Remove highest raw curvature first by retaining the lowest curvature.
         # kvpress keeps the highest importance scores; undefined tokens are last.
-        importance = (-reduced).masked_fill(~torch.isfinite(reduced), -torch.inf)
-        return importance.to(keys.device).view(1, 1, -1).expand(keys.shape[:3])
+        return (-reduced).masked_fill(~torch.isfinite(reduced), -torch.inf)
+
+
+def global_curvature_indices(scores, ratio):
+    """Rank layer/token pairs on CPU using the existing comparison's total budget."""
+    layers, length = len(scores), scores[0].numel()
+    n_kept = layers * compute_n_kept(length, ratio)
+    # Stable ties prefer earlier layers, then earlier tokens; undefined scores are last.
+    selected = torch.cat(scores).argsort(descending=True, stable=True)[:n_kept].sort().values
+    counts = torch.bincount(selected // length, minlength=layers).tolist()
+    return (selected % length).split(counts)
+
+
+@dataclass
+class GlobalCurvaturePress(SavedCurvaturePress):
+    """Share one curvature budget across all layers, allowing empty layer caches."""
+
+    def post_init_from_model(self, model):
+        self._scores, self._indices = [], None
+        if any(getattr(layer.self_attn, "sliding_window", None) is not None
+               or getattr(layer.self_attn, "is_sliding", False) for layer in model.model.layers):
+            raise NotImplementedError("Full-model curvature ranking requires full attention")
+
+    def compress(self, module, hidden_states, keys, values, attentions, kwargs):
+        if self.compression_ratio == 0:
+            return keys, values
+        layers, length = module.config.num_hidden_layers, keys.shape[2]
+        if self.curvature_provider is None:
+            if self._indices is None:
+                # Map/reduce one file at a time; retain only one CPU score per token/layer.
+                scores = [self.reduce_curvature(self.load_curvature(index, length)) for index in range(layers)]
+                self._indices = global_curvature_indices(scores, self.compression_ratio)
+        else:
+            cache = kwargs["past_key_values"]
+            if isinstance(cache, QuantizedCache):
+                raise NotImplementedError("Online full-model curvature ranking requires an unquantized cache")
+            curvature = self.curvature_provider(module, hidden_states, keys, values, attentions, kwargs)
+            self._scores.append(self.reduce_curvature(curvature).cpu())
+            if module.layer_idx != layers - 1:
+                return keys, values
+            # All scores are now available. Earlier caches are referenced in place, never copied.
+            self._indices = global_curvature_indices(self._scores, self.compression_ratio)
+            self._scores.clear()
+            for index, layer in enumerate(cache.layers[:-1]):
+                indices = self._indices[index].to(layer.keys.device)
+                layer.keys = layer.keys.index_select(2, indices)
+                layer.values = layer.values.index_select(2, indices)
+        indices = self._indices[module.layer_idx].to(keys.device)
+        if module.layer_idx == layers - 1:
+            self._indices = None
+        return keys.index_select(2, indices), values.index_select(2, indices)
 
 
 def curvature_method_score(press, scorer, module, hidden_states, keys, values, attentions, kwargs):
@@ -122,12 +179,15 @@ class BudgetMatchedPyramidKVPress(PyramidKVPress):
 
 
 def make_press(method, ratio, curvature_dir=".", *, score_source="native", curvature_reduction="mean",
-               curvature_provider=None, **kwargs):
+               curvature_provider=None, curvature_ranking="layer", **kwargs):
     """Create the same prefill-only methods in both comparison entry points."""
     if method in ("curvature_min", "curvature_mean"):
-        return SavedCurvaturePress(compression_ratio=ratio, curvature_dir=Path(curvature_dir),
-                                   reduction=method.removeprefix("curvature_"),
-                                   curvature_provider=curvature_provider, **kwargs)
+        if curvature_ranking not in ("layer", "model"):
+            raise ValueError(f"Unknown curvature ranking: {curvature_ranking}")
+        cls = GlobalCurvaturePress if curvature_ranking == "model" else SavedCurvaturePress
+        return cls(compression_ratio=ratio, curvature_dir=Path(curvature_dir),
+                   reduction=method.removeprefix("curvature_"),
+                   curvature_provider=curvature_provider, **kwargs)
     if method == "PyramidKVPress":
         cls = BudgetMatchedPyramidKVPress
     elif method == "SnapKVPress":

@@ -31,6 +31,7 @@ SAVE_CURVATURE="${SAVE_CURVATURE:-1}"
 # Use curvature importance in SnapKV, PyramidKV, and ExpectedAttention by default.
 SCORE_SOURCE="${SCORE_SOURCE:-curvature}"
 CURVATURE_REDUCTION="${CURVATURE_REDUCTION:-min}"
+CURVATURE_RANKING="${CURVATURE_RANKING:-layer}"  # model shares the direct curvature budget across layers.
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/logs/graph_curvature/$(date +%Y%m%d_%H%M%S)}"
 # Calculate and save fresh scores; set RUN_CALCULATION=0 and CURVATURE_DIR to reuse a run.
 RUN_CALCULATION="${RUN_CALCULATION:-1}"
@@ -92,6 +93,7 @@ run_evaluation() {
     --curvature-dir "$curvature_dir" --device "$DEVICE" \
     --methods "$PRESSES" --compression-ratios "$COMPRESSION_RATIOS" \
     --score-source "$SCORE_SOURCE" --curvature-reduction "$CURVATURE_REDUCTION" \
+    --curvature-ranking "$CURVATURE_RANKING" \
     "${generation_flags[@]}" "${output_flags[@]}"
 }
 

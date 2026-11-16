@@ -6,13 +6,14 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Evaluate the saved Qasper run; no curvature calculation is performed.
 PYTHON_BIN="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
-CURVATURE_DIR="${CURVATURE_DIR:-$REPO_DIR/logs/graph_curvature/20261109_150356/longbench_qasper}"
-GPU="${GPU:-0}"
-PRESSES="${PRESSES:-curvature_min,curvature_mean,SnapKVPress,ExpectedAttentionPress,PyramidKVPress}"
+CURVATURE_DIR="${CURVATURE_DIR:-$REPO_DIR/logs/graph_curvature/20261109_150356/longbench_multi_news}"
+GPU="${GPU:-1}"
+PRESSES="${PRESSES:-curvature_min,curvature_mean}" # SnapKVPress,ExpectedAttentionPress,PyramidKVPress
 COMPRESSION_RATIOS="${COMPRESSION_RATIOS:-0.3,0.5,0.7,0.9}"
 # Curvature min/mean still load saved scores; other methods use native scoring.
-SCORE_SOURCE="${SCORE_SOURCE:-native}"
+SCORE_SOURCE="${SCORE_SOURCE:-curvature}"
 CURVATURE_REDUCTION="${CURVATURE_REDUCTION:-min}"
+CURVATURE_RANKING="${CURVATURE_RANKING:-model}"  # model shares the direct curvature budget across layers.
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
 EVALUATION_OUTPUT_DIR="${EVALUATION_OUTPUT_DIR:-$CURVATURE_DIR/evaluation/$(date +%Y%m%d_%H%M%S)}"
 
@@ -34,4 +35,5 @@ exec "$PYTHON_BIN" "$REPO_DIR/kv_cache_experiment/evaluate_curvature.py" \
   --curvature-dir "$CURVATURE_DIR" --device cuda:0 \
   --methods "$PRESSES" --compression-ratios "$COMPRESSION_RATIOS" \
   --score-source "$SCORE_SOURCE" --curvature-reduction "$CURVATURE_REDUCTION" \
+  --curvature-ranking "$CURVATURE_RANKING" \
   --output-dir "$EVALUATION_OUTPUT_DIR" "${generation_flags[@]}"

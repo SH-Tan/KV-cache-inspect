@@ -26,6 +26,7 @@ TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
 SAVE_CURVATURE="${SAVE_CURVATURE:-0}"
 SCORE_SOURCE="${SCORE_SOURCE:-curvature}"
 CURVATURE_REDUCTION="${CURVATURE_REDUCTION:-min}"
+CURVATURE_RANKING="${CURVATURE_RANKING:-layer}"  # model shares the direct curvature budget across layers.
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/logs/graph_curvature/$(date +%Y%m%d_%H%M%S)_online}"
 EVALUATION_OUTPUT_DIR="${EVALUATION_OUTPUT_DIR:-}"
 PRESSES="${PRESSES:-curvature_min,SnapKVPress,ExpectedAttentionPress,PyramidKVPress}"
@@ -77,6 +78,7 @@ for task in "${task_names[@]}"; do
     --alpha "$ALPHA" --workers "$WORKERS" --seed "$SEED" \
     --save-curvature "$SAVE_CURVATURE" --score-source "$SCORE_SOURCE" \
     --curvature-reduction "$CURVATURE_REDUCTION" \
+    --curvature-ranking "$CURVATURE_RANKING" \
     --presses "$PRESSES" --compression-ratios "$COMPRESSION_RATIOS" \
     "${flags[@]}" "${output_flags[@]}"
 done

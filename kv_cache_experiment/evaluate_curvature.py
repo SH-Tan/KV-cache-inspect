@@ -92,7 +92,7 @@ class CurvatureComparisonLM(HFLM):
             if observed:
                 return
             layers = output.past_key_values.layers
-            # PyramidKV varies layer sizes; total elements must still match exactly.
+            # PyramidKV and global curvature vary layer sizes; the total must match exactly.
             actual_elements = sum(layer.keys.numel() + layer.values.numel() for layer in layers)
             expected_elements = sum(
                 2 * layer.keys.shape[0] * layer.keys.shape[1] * expected * layer.keys.shape[-1]
@@ -118,7 +118,7 @@ class CurvatureComparisonLM(HFLM):
 
 def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFAULT_RATIOS,
                  device="cuda:0", max_new_tokens=None, output_dir=None, *, online_settings=None,
-                 score_source="native", curvature_reduction="mean"):
+                 score_source="native", curvature_reduction="mean", curvature_ranking="layer"):
     run_dir = Path(curvature_dir)
     online = online_settings is not None
     if online:
@@ -204,6 +204,9 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
         "online_compression": online,
         "save_curvature": bool(settings.get("save_curvature", True)),
         "score_source": score_source, "curvature_score_reduction": curvature_reduction,
+        "curvature_ranking": curvature_ranking,
+        "curvature_ranking_methods": [method for method in methods
+                                      if method in ("curvature_min", "curvature_mean")],
         "curvature_score_methods": [method for method in methods
                                     if score_source == "curvature" and method in CURVATURE_SCORE_METHODS],
         "curvature_query": "last prompt query; curvature variants do not estimate attention for other queries",
@@ -217,6 +220,7 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
         lm.press = None if method == "baseline" else make_press(
             method, ratio, run_dir, score_source=score_source, curvature_reduction=curvature_reduction,
             curvature_provider=lm.curvature_provider,
+            curvature_ranking=curvature_ranking,
         )
         generation = dict(do_sample=False, temperature=0.0)
         if max_new_tokens is not None:
@@ -247,6 +251,8 @@ def main():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--score-source", choices=("native", "curvature"), default="native")
     parser.add_argument("--curvature-reduction", choices=("min", "mean"), default="mean")
+    parser.add_argument("--curvature-ranking", choices=("layer", "model"), default="layer",
+                        help="Rank curvature_min/curvature_mean within each layer or across all layers")
     args = parser.parse_args()
     evaluate_run(**vars(args))
 

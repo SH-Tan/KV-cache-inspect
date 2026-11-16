@@ -65,6 +65,8 @@ def parse_args():
     parser.add_argument("--save-curvature", type=int, choices=(0, 1), default=1)
     parser.add_argument("--score-source", choices=("native", "curvature"), default="native")
     parser.add_argument("--curvature-reduction", choices=("min", "mean"), default="mean")
+    parser.add_argument("--curvature-ranking", choices=("layer", "model"), default="layer",
+                        help="Rank curvature_min/curvature_mean within each layer or across all layers")
     parser.add_argument("--evaluation-output-dir")
 
     args = parser.parse_args()
@@ -265,7 +267,8 @@ def main():
         evaluate_run(args.output_dir, methods=args.presses, compression_ratios=args.compression_ratios,
                      device=args.device, max_new_tokens=args.max_new_tokens,
                      output_dir=args.evaluation_output_dir, online_settings=vars(args),
-                     score_source=args.score_source, curvature_reduction=args.curvature_reduction)
+                     score_source=args.score_source, curvature_reduction=args.curvature_reduction,
+                     curvature_ranking=args.curvature_ranking)
         return
     output = calculate_or_reuse(args)
     if args.evaluate:
@@ -273,7 +276,7 @@ def main():
         evaluate_run(output, methods=args.presses, compression_ratios=args.compression_ratios,
                      device=args.device, max_new_tokens=args.max_new_tokens,
                      output_dir=args.evaluation_output_dir, score_source=args.score_source,
-                     curvature_reduction=args.curvature_reduction)
+                     curvature_reduction=args.curvature_reduction, curvature_ranking=args.curvature_ranking)
 
 
 if __name__ == "__main__":
