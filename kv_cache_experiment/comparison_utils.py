@@ -1,6 +1,6 @@
 """Shared compression defaults and reproducible inference settings."""
 
-DEFAULT_METHODS = "curvature_min,curvature_mean,SnapKVPress,StreamingLLMPress,KnormPress,PyramidKVPress"
+DEFAULT_METHODS = "curvature_min,curvature_second_min,curvature_mean,SnapKVPress,StreamingLLMPress,KnormPress,PyramidKVPress"
 DEFAULT_RATIOS = "0.3,0.5,0.7,0.9"
 
 

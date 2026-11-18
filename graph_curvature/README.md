@@ -27,8 +27,8 @@ PYTHON_BIN=python MODEL_PATH="<model-id-or-path>" bash graph_curvature/run.sh
 | `TASKS` | Comma-separated datasets, processed sequentially; `TASK` still selects one dataset | `longbench_lcc` |
 | `SAVE_CURVATURE` | Write curvature `.pt` files and prompt-token manifest (`1`), or keep curvature transient (`0`) | Offline: `1`; online: `0` |
 | `SCORE_SOURCE` | Use original method scores (`native`), or curvature scoring for SnapKV/PyramidKV/ExpectedAttention (`curvature`) | `curvature` |
-| `CURVATURE_REDUCTION` | Reduce query heads with `min` or `mean` for those three variants; `curvature_min`/`curvature_mean` retain their named reduction | `mean` |
-| `CURVATURE_RANKING` | Rank direct `curvature_min`/`curvature_mean` scores per `layer`, or across the full `model` | `layer` |
+| `CURVATURE_REDUCTION` | Reduce query heads with `min`, `second_min`, or `mean` for those three variants; direct curvature methods retain their named reduction | `mean` |
+| `CURVATURE_RANKING` | Rank direct curvature scores per `layer`, or across the full `model` | `layer` |
 | `OUTPUT_DIR` | Run root; multiple datasets get separate `OUTPUT_DIR/<task>` directories | New timestamped directory |
 | `CURVATURE_DIR` | Saved run directory used for comparison; contains `settings.json` and layer `.pt` files | `OUTPUT_DIR` |
 | `EVALUATION_OUTPUT_DIR` | Optional evaluation root; multiple datasets get separate `<task>` subdirectories | Each task's run directory plus `/evaluation` |
@@ -64,7 +64,7 @@ bash graph_curvature/run.sh
 
 That legacy run contains **0.9-quantile, algorithm-version-1** curvature. New calculations use **0.7, version 2**. Comparison-only mode can evaluate older runs and records their original quantile/version. Resuming calculation requires matching versions so corrected OT results are not mixed with older files.
 
-The launcher comparison is an uncompressed baseline plus `curvature_min`, `curvature_mean`, `SnapKVPress`, `ExpectedAttentionPress`, and `PyramidKVPress`, at removal ratios `0.3,0.5,0.7,0.9`. Configure `PRESSES`, `COMPRESSION_RATIOS`, and optional `MAX_NEW_TOKENS` in the launcher, or `--methods`, `--compression-ratios`, and `--max-new-tokens` in the standalone evaluator. Generation is greedy, with the saved seed and the task's generation cap unless overridden.
+The launcher comparison is an uncompressed baseline plus `curvature_min`, `curvature_second_min`, `curvature_mean`, `SnapKVPress`, `ExpectedAttentionPress`, and `PyramidKVPress`, at removal ratios `0.3,0.5,0.7,0.9`. Configure `PRESSES`, `COMPRESSION_RATIOS`, and optional `MAX_NEW_TOKENS` in the launcher, or `--methods`, `--compression-ratios`, and `--max-new-tokens` in the standalone evaluator. Generation is greedy, with the saved seed and the task's generation cap unless overridden.
 
 For online calculation without saving `.pt` files:
 
@@ -84,7 +84,7 @@ Online mode computes curvature from the actual normalized layer input, native un
 
 Curvature variants use **only the last prompt query's curvature**, not SnapKV's original multi-query attention estimate. The SnapKV variant uses finite-only pooling and retains priority for recent window tokens; PyramidKV also keeps its layer allocation and exact total KV budget. ExpectedAttention replaces its statistical attention predictor with softmax of negative reduced curvature, retaining its optional value-norm scaling and sink-token priority. StreamingLLM's position policy and Knorm's key norms do not use attention scores and remain unchanged. These are curvature variants of the methods, not their original attention algorithms; `comparison.json` records the score source, head reduction, and affected methods once.
 
-The direct `curvature_min` and `curvature_mean` methods **remove the highest raw-curvature tokens first** and retain the lowest-curvature tokens. After taking minimum or finite-only mean across query heads for each token, kvpress receives the negative of that reduced curvature because its top-k operation selects tokens to keep. The same token scores are shared by all KV heads without copying them. The stored per-head descending `curvature_ranking` is not used for the cross-head reduction. Each layer's score file is memory-mapped on CPU when needed; full model attention matrices are not retained.
+The direct `curvature_min`, `curvature_second_min`, and `curvature_mean` methods **remove the highest raw-curvature tokens first** and retain the lowest-curvature tokens. After taking minimum, second minimum, or finite-only mean across query heads for each token, kvpress receives the negative of that reduced curvature because its top-k operation selects tokens to keep. The same token scores are shared by all KV heads without copying them. The second minimum counts tied values separately and requires two finite heads. The stored per-head descending `curvature_ranking` is not used for the cross-head reduction. Each layer's score file is memory-mapped on CPU when needed; full model attention matrices are not retained.
 
 Set `CURVATURE_RANKING=model` (CLI: `--curvature-ranking model`) to rank those reduced scores jointly over all layers for each prompt. Layers can retain different numbers of tokens, including zero. The total retained budget remains `num_layers * max(1, int(prompt_length * (1 - removal_ratio)))`, matching the existing comparison methods and integer rounding. No minimum is imposed on individual layers. Equal scores prefer earlier layers, then earlier tokens; undefined scores have lowest retention priority. The default `layer` mode and the allocation/pooling/window/sink policies of other methods, including curvature-scored variants, remain unchanged. `comparison.json` records the ranking mode and the direct methods it applies to.
 

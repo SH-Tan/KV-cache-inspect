@@ -29,7 +29,7 @@ CURVATURE_REDUCTION="${CURVATURE_REDUCTION:-min}"
 CURVATURE_RANKING="${CURVATURE_RANKING:-layer}"  # model shares the direct curvature budget across layers.
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/logs/graph_curvature/$(date +%Y%m%d_%H%M%S)_online}"
 EVALUATION_OUTPUT_DIR="${EVALUATION_OUTPUT_DIR:-}"
-PRESSES="${PRESSES:-curvature_min,SnapKVPress,ExpectedAttentionPress,PyramidKVPress}"
+PRESSES="${PRESSES:-curvature_min,curvature_second_min,SnapKVPress,ExpectedAttentionPress,PyramidKVPress}"
 COMPRESSION_RATIOS="${COMPRESSION_RATIOS:-0.3,0.5,0.7,0.9}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
 

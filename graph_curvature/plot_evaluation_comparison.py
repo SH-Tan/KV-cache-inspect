@@ -36,7 +36,10 @@ def plot_curvature_ranking_comparison(layer_path, model_path, output_path):
 
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
     for method, color in (("curvature_min", "#8c3b8c"),
+                          ("curvature_second_min", "#9333ea"),
                           ("curvature_mean", "#2a8c68")):
+        if not any(name == method for name, _ in layer.keys() & model.keys()):
+            continue
         for cases, style, label in ((layer, "o--", "Layer-level (old)"),
                                      (model, "s-", "Model-level (new)")):
             ratios = sorted(ratio for name, ratio in cases if name == method)
@@ -49,7 +52,7 @@ def plot_curvature_ranking_comparison(layer_path, model_path, output_path):
                  f"{layer_settings['prompt_count']} prompts",
            xlabel="KV removal ratio", ylabel="LongBench score (%)",
            xticks=sorted({ratio for name, ratio in layer.keys() | model.keys()
-                          if name in ("curvature_min", "curvature_mean")}))
+                          if name in ("curvature_min", "curvature_second_min", "curvature_mean")}))
     ax.grid(alpha=0.2)
     ax.legend(fontsize=9)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +87,10 @@ def plot_comparison(native_path, curvature_path, output_path):
 
     ax = axes.flat[3]
     for method, color, marker in (("curvature_min", "#8c3b8c", "D"),
+                                  ("curvature_second_min", "#9333ea", "v"),
                                   ("curvature_mean", "#2a8c68", "^")):
+        if (method, ratios[0]) not in curvature:
+            continue
         ax.plot(ratios, [curvature[(method, ratio)] for ratio in ratios], marker + "-",
                 color=color, linewidth=2, label=method)
     ax.set_title("Direct curvature ranking")
@@ -113,7 +119,10 @@ def plot_comparison(native_path, curvature_path, output_path):
         ax.plot(ratios, [curvature[(method, ratio)] for ratio in ratios], "s--",
                 color=colors[method], linewidth=2, label=f"{name} · saved curvature")
     for method, color, marker in (("curvature_min", "#8c3b8c", "D"),
+                                  ("curvature_second_min", "#9333ea", "v"),
                                   ("curvature_mean", "#795329", "^")):
+        if (method, ratios[0]) not in curvature:
+            continue
         ax.plot(ratios, [curvature[(method, ratio)] for ratio in ratios], marker + "-",
                 color=color, linewidth=2, label=method)
     ax.axhline(baseline, color="#777777", linestyle=":", linewidth=1.5,

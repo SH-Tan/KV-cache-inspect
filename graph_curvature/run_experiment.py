@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument("--score-source", choices=("native", "curvature"), default="native")
     parser.add_argument("--curvature-reduction", choices=("min", "mean"), default="mean")
     parser.add_argument("--curvature-ranking", choices=("layer", "model"), default="layer",
-                        help="Rank curvature_min/curvature_mean within each layer or across all layers")
+                        help="Rank direct curvature methods within each layer or across all layers")
     parser.add_argument("--evaluation-output-dir")
 
     args = parser.parse_args()

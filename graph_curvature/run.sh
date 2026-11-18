@@ -42,7 +42,7 @@ else
   CURVATURE_DIR="${CURVATURE_DIR:-$OUTPUT_DIR}"
 fi
 EVALUATION_OUTPUT_DIR="${EVALUATION_OUTPUT_DIR:-}"
-PRESSES="${PRESSES:-curvature_min,curvature_mean,SnapKVPress,ExpectedAttentionPress,PyramidKVPress}"
+PRESSES="${PRESSES:-curvature_min,curvature_second_min,curvature_mean,SnapKVPress,ExpectedAttentionPress,PyramidKVPress}"
 COMPRESSION_RATIOS="${COMPRESSION_RATIOS:-0.3,0.5,0.7,0.9}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
 

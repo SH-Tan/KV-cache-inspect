@@ -8,12 +8,12 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
 CURVATURE_DIR="${CURVATURE_DIR:-$REPO_DIR/logs/graph_curvature/20261109_150356/longbench_multi_news}"
 GPU="${GPU:-1}"
-PRESSES="${PRESSES:-curvature_min,curvature_mean}" # SnapKVPress,ExpectedAttentionPress,PyramidKVPress
+PRESSES="${PRESSES:-curvature_second_min}" # SnapKVPress,ExpectedAttentionPress,PyramidKVPress
 COMPRESSION_RATIOS="${COMPRESSION_RATIOS:-0.3,0.5,0.7,0.9}"
-# Curvature min/mean still load saved scores; other methods use native scoring.
+# Direct curvature methods load saved scores; other methods use native scoring.
 SCORE_SOURCE="${SCORE_SOURCE:-curvature}"
 CURVATURE_REDUCTION="${CURVATURE_REDUCTION:-min}"
-CURVATURE_RANKING="${CURVATURE_RANKING:-model}"  # model shares the direct curvature budget across layers.
+CURVATURE_RANKING="${CURVATURE_RANKING:-layer}"  # model shares the direct curvature budget across layers.
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
 EVALUATION_OUTPUT_DIR="${EVALUATION_OUTPUT_DIR:-$CURVATURE_DIR/evaluation/$(date +%Y%m%d_%H%M%S)}"
 

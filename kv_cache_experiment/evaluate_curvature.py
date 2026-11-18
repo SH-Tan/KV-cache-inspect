@@ -195,7 +195,7 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
         "curvature_algorithm_version": settings.get("curvature_algorithm_version", 1),
         "window_attention_scaling": "model.scaling for SnapKV and PyramidKV",
         "compression_scope": "prefill_only; generated tokens are retained",
-        "curvature_reduction": "min/mean across all query heads; same token scores for each KV head",
+        "curvature_reduction": "min/second_min/mean across finite query heads; same token scores for each KV head",
         "curvature_removal_order": "negative reduced curvature is importance; variants then apply pooling/window or sink/value-norm policies",
         "budget": "equal total prefill KV elements; PyramidKV rounding matched to uniform budget",
         "generation": {"do_sample": False, "max_gen_toks": max_new_tokens or task.config.generation_kwargs["max_gen_toks"]},
@@ -206,7 +206,7 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
         "score_source": score_source, "curvature_score_reduction": curvature_reduction,
         "curvature_ranking": curvature_ranking,
         "curvature_ranking_methods": [method for method in methods
-                                      if method in ("curvature_min", "curvature_mean")],
+                                      if method in ("curvature_min", "curvature_second_min", "curvature_mean")],
         "curvature_score_methods": [method for method in methods
                                     if score_source == "curvature" and method in CURVATURE_SCORE_METHODS],
         "curvature_query": "last prompt query; curvature variants do not estimate attention for other queries",
@@ -252,7 +252,7 @@ def main():
     parser.add_argument("--score-source", choices=("native", "curvature"), default="native")
     parser.add_argument("--curvature-reduction", choices=("min", "mean"), default="mean")
     parser.add_argument("--curvature-ranking", choices=("layer", "model"), default="layer",
-                        help="Rank curvature_min/curvature_mean within each layer or across all layers")
+                        help="Rank direct curvature methods within each layer or across all layers")
     args = parser.parse_args()
     evaluate_run(**vars(args))
 

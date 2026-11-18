@@ -64,6 +64,8 @@ class SavedCurvaturePress(ScorerPress):
         finite = torch.isfinite(curvature)
         if self.reduction == "min":
             reduced = curvature.masked_fill(~finite, torch.inf).amin(dim=0)
+        elif self.reduction == "second_min":
+            reduced = curvature.masked_fill(~finite, torch.inf).kthvalue(2, dim=0).values
         elif self.reduction == "mean":
             reduced = curvature.masked_fill(~finite, 0).sum(dim=0, dtype=torch.float64) / finite.sum(dim=0)
         else:
@@ -181,7 +183,7 @@ class BudgetMatchedPyramidKVPress(PyramidKVPress):
 def make_press(method, ratio, curvature_dir=".", *, score_source="native", curvature_reduction="mean",
                curvature_provider=None, curvature_ranking="layer", **kwargs):
     """Create the same prefill-only methods in both comparison entry points."""
-    if method in ("curvature_min", "curvature_mean"):
+    if method in ("curvature_min", "curvature_second_min", "curvature_mean"):
         if curvature_ranking not in ("layer", "model"):
             raise ValueError(f"Unknown curvature ranking: {curvature_ranking}")
         cls = GlobalCurvaturePress if curvature_ranking == "model" else SavedCurvaturePress
