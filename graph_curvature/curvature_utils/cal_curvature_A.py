@@ -20,7 +20,7 @@ from .curv_tensor_utils import _get_matrix_torch, adaptive_chunksize
 
 # Fork workers inherit these read-only CPU arrays for one prompt.
 _WORKER_STATE = None
-CURVATURE_ALGORITHM_VERSION = 2
+CURVATURE_ALGORITHM_VERSION = 3
 
 
 def _transport_cost(mu, nu, cost):
@@ -156,6 +156,11 @@ def compute_a_curvature(
                     evaluations += count
                     in_neighbors += in_count
                     out_neighbors += out_count
+
+        # Exact-zero attention has infinite cost and is excluded from valid_heads.
+        # Apply its prescribed curvature after collecting worker results.
+        zero_attention = (operations['A'][0, :, 0].detach() == 0).cpu().numpy()
+        curvature[zero_attention] = 1.0
 
         metrics = {
             'costs': {
