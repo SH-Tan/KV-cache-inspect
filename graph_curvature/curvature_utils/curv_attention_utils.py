@@ -21,16 +21,28 @@ def _get_a_head_dims(operations):
 
 
 def _attention_costs(attention, device="cpu"):
-    return attention.detach().to(
+    costs = attention.detach().to(
         device=device, dtype=curvature_torch_dtype(), copy=True,
     ).abs_().reciprocal_()
+    # Invalid coefficients are absent edges, never NaN/zero-cost shortcuts.
+    return costs.masked_fill_(~torch.isfinite(costs) | (costs <= 0), torch.inf)
+
+
+def aggregate_attention_rows(attention, query_aggregation):
+    """Keep [batch, heads, tokens]; means exclude zero attention entries."""
+    if attention.shape[-2] == 1:
+        return attention[..., 0, :]
+    if query_aggregation == "attention_max":
+        return attention.amax(dim=-2).to(dtype=curvature_torch_dtype())
+    counts = attention.count_nonzero(dim=-2).clamp_min_(1)
+    return attention.sum(dim=-2, dtype=curvature_torch_dtype()).div_(counts)
 
 
 def _get_a_head_costs(operations, device="cpu"):
-    """Return final-query attention costs, their CPU array, and valid-head mask."""
+    """Return selected-row attention costs, their CPU array, and valid-head mask."""
     head_costs = _attention_costs(operations["A"][0, :, 0], device=device)
     head_costs_np = head_costs.cpu().numpy()
-    valid_heads = np.isfinite(head_costs_np) & (head_costs_np > 0)
+    valid_heads = np.isfinite(head_costs_np)
     return head_costs, head_costs_np, valid_heads
 
 

@@ -189,6 +189,8 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
         "curvature_files": "layer_{layer:03d}/prompt_{prompt:05d}.pt",
         "alpha": settings["alpha"],
         "curvature_dtype": settings["curvature_dtype"],
+        "last_k": settings.get("last_k", 1),
+        "query_aggregation": settings.get("query_aggregation", "attention_mean"),
         "layer_start": settings["layer_start"], "layer_end": settings["layer_end"],
         "attention_edge_definition": settings.get("attention_edge_definition"),
         "neighbor_keep_quantile": settings["neighbor_keep_quantile"],
@@ -209,7 +211,7 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
                                       if method in ("curvature_min", "curvature_second_min", "curvature_mean")],
         "curvature_score_methods": [method for method in methods
                                     if score_source == "curvature" and method in CURVATURE_SCORE_METHODS],
-        "curvature_query": "last prompt query; curvature variants do not estimate attention for other queries",
+        "curvature_query": "last min(last_k, prompt length) queries; reduced to one score per head/token",
         "curvature_attention_replacement": "SnapKV/PyramidKV pool negative curvature; ExpectedAttention applies softmax before value-norm scaling",
     }
     report = {"settings": report, "cases": []}

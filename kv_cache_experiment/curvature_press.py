@@ -128,7 +128,7 @@ class GlobalCurvaturePress(SavedCurvaturePress):
 def curvature_method_score(press, scorer, module, hidden_states, keys, values, attentions, kwargs):
     """Replace attention importance, retaining the method's pooling/window or sink policy.
 
-    Curvature is available for the last prompt query only, not a multi-query window.
+    Curvature supplies one aggregated score per head/token.
     """
     scores = scorer.score(module, hidden_states, keys, values, attentions, kwargs)
     if isinstance(press, SnapKVPress):

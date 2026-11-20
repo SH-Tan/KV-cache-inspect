@@ -16,12 +16,15 @@ COMPUTE_DEVICE="${COMPUTE_DEVICE:-cpu}"
 DTYPE="${DTYPE:-auto}"
 CURVATURE_DTYPE="${CURVATURE_DTYPE:-float32}"
 # TASK still selects one dataset; TASKS selects a comma-separated list.
-TASKS="${TASKS:-${TASK:-longbench_lcc,longbench_qasper,longbench_trec,longbench_multi_news}}"
+TASKS="${TASKS:-${TASK:-longbench_lcc,longbench_qasper}}"
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 MAX_LENGTH="${MAX_LENGTH:-}"
 LAYER_START="${LAYER_START:-0}"
 LAYER_END="${LAYER_END:-}"
 ALPHA="${ALPHA:-0.5}"
+LAST_K="${LAST_K:-32}"
+# attention_mean/attention_max: reduce A first; curvature_mean/curvature_min: curvature first.
+QUERY_AGGREGATION="${QUERY_AGGREGATION:-attention_mean}"
 # This A40 host has 48 physical cores / 96 logical CPUs.
 WORKERS="${WORKERS:-48}"
 SEED="${SEED:-29}"
@@ -128,6 +131,7 @@ for task in "${task_names[@]}"; do
       --dtype "$DTYPE" --curvature-dtype "$CURVATURE_DTYPE" \
       --task "$task" --num-samples "$NUM_SAMPLES" --layer-start "$LAYER_START" \
       --alpha "$ALPHA" --workers "$WORKERS" --seed "$SEED" \
+      --last-k "$LAST_K" --query-aggregation "$QUERY_AGGREGATION" \
       --save-curvature "$SAVE_CURVATURE" --score-source "$SCORE_SOURCE" \
       --curvature-reduction "$CURVATURE_REDUCTION" "${flags[@]}"
   fi

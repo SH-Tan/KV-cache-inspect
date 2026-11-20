@@ -53,6 +53,11 @@ def parse_args():
     parser.add_argument("--layer-start", type=int, default=0)
     parser.add_argument("--layer-end", type=int, help="Exclusive layer index; defaults to all layers")
     parser.add_argument("--alpha", type=float, default=0.0)
+    parser.add_argument("--last-k", type=int, default=1,
+                        help="Use the last min(k, prompt length) attention query rows")
+    parser.add_argument("--query-aggregation", default="attention_mean",
+                        choices=("curvature_mean", "curvature_min", "attention_mean", "attention_max"),
+                        help="Reduce per-row curvature, or reduce attention before curvature")
     parser.add_argument("--workers", type=int, default=48,
                         help="CPU curvature processes; default: 48 physical cores on the A40 host")
     parser.add_argument("--seed", type=int, default=29)
@@ -72,7 +77,7 @@ def parse_args():
     args = parser.parse_args()
 
     # Reject settings that would silently skip work or make curvature undefined.
-    for name in ("num_samples", "workers"):
+    for name in ("num_samples", "workers", "last_k"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if not 0 <= args.alpha < 1:
@@ -109,7 +114,7 @@ def load_dataset(args):
 
 @torch.no_grad()
 def calculate_layer_curvature(model, layer_id, inputs, args):
-    """Propagate prompts and save each prompt's last-row A scores independently."""
+    """Propagate prompts and save each prompt's aggregated A curvature independently."""
     layer = model.model.layers[layer_id]
     calculate = layer_id >= args.layer_start
     layer_cache = None
@@ -125,6 +130,7 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
         hidden_out, operations = collect_layer_data(
             layer, hidden.to(args.device), None, positions, model,
             operation_dtype=curvature_torch_dtype(),
+            last_k=args.last_k,
         )
         inputs[sample_idx] = hidden_out.cpu()
         del hidden_out
@@ -147,7 +153,7 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
 
         curvature, metrics = compute_a_curvature(
             operations, layer_cache, alpha=args.alpha, device=args.compute_device,
-            workers=args.workers,
+            workers=args.workers, query_aggregation=args.query_aggregation,
         )
         metrics['curvature'] = _summarize_curvatures(curvature)
         prompt_records.append(metrics)
@@ -201,7 +207,7 @@ def calculate_or_reuse(args):
         previous = json.loads(settings_path.read_text())
         for key in ("model_path", "tokenizer_path", "task", "num_samples", "max_length", "dtype",
                     "curvature_dtype", "alpha", "seed", "layer_start", "layer_end", "neighbor_keep_quantile",
-                    "curvature_algorithm_version"):
+                    "curvature_algorithm_version", "last_k", "query_aggregation"):
             if previous.get(key) != settings[key]:
                 raise ValueError(f"Cannot reuse curvature with changed {key}: {previous.get(key)} -> {settings[key]}. "
                                  "Use a new output directory, or evaluate the existing scores with "

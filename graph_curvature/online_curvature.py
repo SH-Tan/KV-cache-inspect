@@ -1,4 +1,4 @@
-"""Calculate last-query curvature from the live prefill, before KV compression."""
+"""Calculate selected-query curvature from the live prefill, before KV compression."""
 
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,13 +24,14 @@ class OnlineCurvature:
 
     @contextmanager
     def capture(self, prompt_length):
-        """Retain only the current layer's last projected query; ignore decoding."""
+        """Retain only the current layer's selected queries; ignore decoding."""
+        last_k = self.settings.get("last_k", 1)
         def record_projection(module, inputs, output):
             if inputs[0].shape[1] == prompt_length and self.projection is None:
                 dtype = curvature_torch_dtype()
                 self.projection = (
-                    inputs[0][:, -1:].detach().to(device="cpu", dtype=dtype, copy=True),
-                    output[:, -1:].detach().to(device="cpu", dtype=dtype, copy=True),
+                    inputs[0][:, -last_k:].detach().to(device="cpu", dtype=dtype, copy=True),
+                    output[:, -last_k:].detach().to(device="cpu", dtype=dtype, copy=True),
                 )
 
         handles = [layer.self_attn.o_proj.register_forward_hook(record_projection)
@@ -46,13 +47,19 @@ class OnlineCurvature:
     def __call__(self, module, hidden_states, keys, values, attentions, kwargs):
         """Use the native, uncompressed layer cache and actual O-projection output."""
         cos, sin = kwargs["position_embeddings"]
-        query = get_query_states(module, hidden_states[:, -1:], (cos[:, -1:], sin[:, -1:]))
+        last_k = self.settings.get("last_k", 1)
+        query = get_query_states(module, hidden_states[:, -last_k:], (cos[:, -last_k:], sin[:, -last_k:]))
         batch, kv_heads, length, dim = keys.shape
         groups = query.shape[1] // kv_heads
+        rows = query.shape[-2]
         # Broadcast GQA groups instead of copying the full key cache across heads.
-        logits = query.reshape(batch, kv_heads, groups, 1, dim) @ keys.unsqueeze(2).transpose(-2, -1)
-        logits = logits.reshape(batch, kv_heads * groups, 1, length)
+        logits = query.reshape(batch, kv_heads, groups, rows, dim) @ keys.unsqueeze(2).transpose(-2, -1)
+        logits = logits.reshape(batch, kv_heads * groups, rows, length)
         logits.mul_(getattr(module, "scaling", dim ** -0.5))
+        if rows > 1:
+            query_positions = torch.arange(length - rows, length, device=keys.device)
+            future = torch.arange(length, device=keys.device)[None, :] > query_positions[:, None]
+            logits.masked_fill_(future, -torch.inf)
         attention = logits.softmax(dim=-1, dtype=torch.float32).to(query.dtype)
         dtype = curvature_torch_dtype()
         attn_out, projected = self.projection
@@ -67,6 +74,7 @@ class OnlineCurvature:
         curvature, metrics = compute_a_curvature(
             operations, layer_cache, alpha=self.settings["alpha"],
             device=self.settings["compute_device"], workers=self.settings["workers"],
+            query_aggregation=self.settings.get("query_aggregation", "attention_mean"),
         )
         if self.settings["save_curvature"]:
             metrics["curvature"] = _summarize_curvatures(curvature)

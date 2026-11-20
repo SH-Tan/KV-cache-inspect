@@ -9,11 +9,12 @@ def scaled_dot_product_attention(
     is_causal=False,
     scale=None,
     enable_gqa=False,
+    last_k=1,
 ):
-    """Return attention output and last-row attention probabilities.
+    """Return attention output and the last-k attention rows.
 
     Supports full causal prefill (L=S) and single-token decoding (L=1).
-    A_last shape: [batch, query_heads, 1, key_length].
+    A_last shape: [batch, query_heads, min(last_k, query_length), key_length].
     Assumes the decoding query is the latest token.
     """
     if dropout_p != 0.0:
@@ -36,23 +37,25 @@ def scaled_dot_product_attention(
 
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
 
-    # Only compute the final query's attention probabilities.
-    q_last = query[..., -1:, :]
+    # Materialize only the selected query rows.
+    q_last = query[..., -last_k:, :]
 
     scores = torch.matmul(
         q_last, key.transpose(-2, -1)
     ) * scale_factor
 
     if attn_mask is not None:
-        mask_last = attn_mask[..., -1:, :]
+        mask_last = attn_mask[..., -q_last.shape[-2]:, :]
 
         if mask_last.dtype == torch.bool:
             scores = scores.masked_fill(~mask_last, float("-inf"))
         else:
             scores = scores + mask_last.to(scores.dtype)
 
-    # For the final token of causal self-attention,
-    # all keys are past or current, so no additional causal mask is needed.
+    if is_causal and q_last.shape[-2] > 1:
+        query_positions = torch.arange(L - q_last.shape[-2], L, device=query.device)
+        future = torch.arange(S, device=query.device)[None, :] > query_positions[:, None]
+        scores.masked_fill_(future, float("-inf"))
     A_last = torch.softmax(
         scores, dim=-1, dtype=torch.float32
     ).to(query.dtype)
@@ -141,18 +144,18 @@ def _resolve_attention_dims(layer, model):
 
 
 def _store_operation(op_bank, name, node, dtype=None):
-    node = node.detach().cpu()
-    if dtype is not None and torch.is_floating_point(node):
-        node = node.to(dtype=dtype)
-    op_bank[name] = node
+    if dtype is None or not torch.is_floating_point(node):
+        dtype = node.dtype
+    # Copy only the selected slice, including on CPU; do not retain its full backing storage.
+    op_bank[name] = node.detach().to(device="cpu", dtype=dtype, copy=True)
 
 
 @torch.no_grad()
-def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_dtype=None):
+def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_dtype=None, last_k=1):
     """Run one decoder layer; retain only the CPU values needed for A curvature.
 
-    layer_input/V keep all key tokens. A keeps the final query row in its original dtype; Att_out
-    and o_proj keep only that query's feature vectors. Full attention and MLP
+    layer_input/V keep all key tokens. A keeps the last-k rows in its original dtype; Att_out
+    and o_proj keep those queries' feature vectors. Full attention and MLP
     computation still produce the hidden states required by the next layer.
     """
     if getattr(layer.self_attn, "sliding_window", None) is not None:
@@ -186,14 +189,15 @@ def collect_layer_data(layer, x, attention_mask, position_ids, model, operation_
         q, k, v, attn_mask=attention_mask,
         is_causal=attention_mask is None,
         scale=getattr(layer.self_attn, "scaling", None),
+        last_k=last_k,
     )
     attn_context = _merge_heads(attn_output)
     _store_operation(operations, "A", attention)
-    _store_operation(operations, "Att_out", attn_context[:, -1:], operation_dtype)
+    _store_operation(operations, "Att_out", attn_context[:, -last_k:], operation_dtype)
     del q, k, v, attention, attn_output
 
     projected = layer.self_attn.o_proj(attn_context)
-    _store_operation(operations, "o_proj", projected[:, -1:], operation_dtype)
+    _store_operation(operations, "o_proj", projected[:, -last_k:], operation_dtype)
     del attn_context
     
     residual_multiplier = getattr(layer, "residual_multiplier", 1.0)

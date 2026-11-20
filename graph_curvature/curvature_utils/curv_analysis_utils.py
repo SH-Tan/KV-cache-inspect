@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .curv_attention_utils import aggregate_attention_rows
+
 
 def finite_cost_statistics(values, chunk_size=65536):
     """Accumulate finite costs in float64 with bounded temporary memory."""
@@ -60,10 +62,15 @@ def save_a_curvature(path, layer_id, prompt_id, operations, curvature, metrics):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     token_count = operations['layer_input'].shape[1]
+    query_count = operations['A'].shape[-2]
+    query_aggregation = metrics.get('query_aggregation', 'attention_mean')
     torch.save({
         "layer_id": layer_id, "prompt_id": prompt_id,
         "token_count": token_count, "query_index": token_count - 1,
-        "attention_scores": operations['A'][0, :, 0].contiguous(),
+        "query_start_index": token_count - query_count,
+        "query_count": query_count, "query_aggregation": query_aggregation,
+        "attention_scores": aggregate_attention_rows(operations['A'], query_aggregation)[0].contiguous(),
+        **({"attention_rows": operations['A'][0].contiguous()} if query_count > 1 else {}),
         "curvature_scores": {"A": curvature},
         "curvature_ranking": rank_a_curvature(curvature), "metrics": metrics,
     }, path)
