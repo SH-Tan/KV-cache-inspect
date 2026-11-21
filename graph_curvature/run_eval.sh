@@ -4,11 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Evaluate the saved Qasper run; no curvature calculation is performed.
+# Evaluate saved scores; no curvature calculation is performed.
 PYTHON_BIN="${PYTHON_BIN:-/home/tans5/anaconda3/envs/prune_llm/bin/python}"
-CURVATURE_DIR="${CURVATURE_DIR:-$REPO_DIR/logs/graph_curvature/20261109_150356/longbench_multi_news}"
-GPU="${GPU:-1}"
-PRESSES="${PRESSES:-curvature_second_min}" # SnapKVPress,ExpectedAttentionPress,PyramidKVPress
+# For curvature_both, select the saved .../curvature_min or .../curvature_mean folder.
+CURVATURE_DIR="${CURVATURE_DIR:-$REPO_DIR/logs/graph_curvature/20261120_163717/longbench_lcc}"
+GPU="${GPU:-0}"
+# These methods reduce the saved scores across heads, independently of query aggregation.
+PRESSES="${PRESSES:-curvature_min,curvature_mean,curvature_second_min,SnapKVPress,ExpectedAttentionPress,PyramidKVPress}" # SnapKVPress,ExpectedAttentionPress,PyramidKVPress
 COMPRESSION_RATIOS="${COMPRESSION_RATIOS:-0.3,0.5,0.7,0.9}"
 # Direct curvature methods load saved scores; other methods use native scoring.
 SCORE_SOURCE="${SCORE_SOURCE:-curvature}"

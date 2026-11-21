@@ -2,7 +2,6 @@
 """Load a model and LongBench prompts, collect layer values, and calculate A curvature."""
 
 import argparse
-import hashlib
 from itertools import islice
 import json
 import os
@@ -56,8 +55,8 @@ def parse_args():
     parser.add_argument("--last-k", type=int, default=1,
                         help="Use the last min(k, prompt length) attention query rows")
     parser.add_argument("--query-aggregation", default="attention_mean",
-                        choices=("curvature_mean", "curvature_min", "attention_mean", "attention_max"),
-                        help="Reduce per-row curvature, or reduce attention before curvature")
+                        choices=("curvature_mean", "curvature_min", "curvature_both", "attention_mean", "attention_max"),
+                        help="Reduce attention first, or curvature first; curvature_both saves mean/min in one pass")
     parser.add_argument("--workers", type=int, default=48,
                         help="CPU curvature processes; default: 48 physical cores on the A40 host")
     parser.add_argument("--seed", type=int, default=29)
@@ -86,6 +85,8 @@ def parse_args():
         parser.error("--max-length must be positive")
     if args.evaluate and not args.online_compression and not args.save_curvature:
         parser.error("Offline evaluation requires --save-curvature 1; use --online-compression otherwise")
+    if args.online_compression and args.query_aggregation == "curvature_both":
+        parser.error("Online compression needs one query aggregation; curvature_both is for offline saving")
 
     return args
 
@@ -112,17 +113,22 @@ def load_dataset(args):
     return [task.doc_to_text(doc) for doc in islice(task.test_docs(), args.num_samples)]
 
 
+def curvature_output_dirs(args):
+    """Keep paired outputs independently usable by the existing evaluator."""
+    output = Path(args.output_dir)
+    if args.query_aggregation == "curvature_both":
+        return {mode: output / mode for mode in ("curvature_min", "curvature_mean")}
+    return {args.query_aggregation: output}
+
+
 @torch.no_grad()
 def calculate_layer_curvature(model, layer_id, inputs, args):
     """Propagate prompts and save each prompt's aggregated A curvature independently."""
     layer = model.model.layers[layer_id]
     calculate = layer_id >= args.layer_start
     layer_cache = None
-    layer_dir = Path(args.output_dir) / f"layer_{layer_id:03d}"
-    if calculate and args.save_curvature:
-        layer_dir.mkdir(parents=True, exist_ok=True)
-    prompt_records = []
-    record_ids = []
+    outputs = curvature_output_dirs(args)
+    prompt_records = {mode: [] for mode in outputs}
     prompt_tokens = [hidden.shape[1] for hidden in inputs]
 
     for sample_idx, hidden in enumerate(inputs):
@@ -138,35 +144,42 @@ def calculate_layer_curvature(model, layer_id, inputs, args):
             del operations
             continue
 
-        path = layer_dir / f"prompt_{sample_idx:05d}.pt"
-        if args.save_curvature and path.exists():
-            saved = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-            if saved['token_count'] != hidden.shape[1]:
-                raise ValueError(f"Saved curvature prompt length changed: {path}")
-            prompt_records.append(saved["metrics"])
-            record_ids.append(sample_idx)
-            print(f"Reusing {path}", flush=True)
-            del saved, operations
+        missing = {}
+        for mode, output in outputs.items():
+            path = output / f"layer_{layer_id:03d}" / f"prompt_{sample_idx:05d}.pt"
+            if args.save_curvature and path.exists():
+                saved = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+                if saved['token_count'] != hidden.shape[1]:
+                    raise ValueError(f"Saved curvature prompt length changed: {path}")
+                prompt_records[mode].append(saved["metrics"])
+                print(f"Reusing {path}", flush=True)
+                del saved
+            else:
+                missing[mode] = path
+        if not missing:
+            del operations
             continue
         if layer_cache is None:
             layer_cache = build_a_layer_cache(model, layer_id, args.compute_device)
 
         curvature, metrics = compute_a_curvature(
             operations, layer_cache, alpha=args.alpha, device=args.compute_device,
-            workers=args.workers, query_aggregation=args.query_aggregation,
+            workers=args.workers,
+            query_aggregation="curvature_both" if len(missing) == 2 else next(iter(missing)),
         )
-        metrics['curvature'] = _summarize_curvatures(curvature)
-        prompt_records.append(metrics)
-        record_ids.append(sample_idx)
-        if args.save_curvature:
-            save_a_curvature(path, layer_id, sample_idx, operations, curvature, metrics)
-            print(f"Saved {path}", flush=True)
-        del curvature, operations
+        curvatures = curvature if len(missing) == 2 else {next(iter(missing)): curvature}
+        for mode, scores in curvatures.items():
+            record = metrics | {'query_aggregation': mode, 'curvature': _summarize_curvatures(scores)}
+            prompt_records[mode].append(record)
+            if args.save_curvature:
+                save_a_curvature(missing[mode], layer_id, sample_idx, operations, scores, record)
+                print(f"Saved {missing[mode]}", flush=True)
+        del curvature, curvatures, scores, operations
 
-    if prompt_records:
-        log_path = Path(args.output_dir) / "analysis" / f"layer_{layer_id:03d}_A_summary.txt"
-        write_curvature_summary(log_path, [prompt_tokens[i] for i in record_ids],
-                                prompt_records, prompt_ids=record_ids)
+    for mode, records in prompt_records.items():
+        if records:
+            log_path = outputs[mode] / "analysis" / f"layer_{layer_id:03d}_A_summary.txt"
+            write_curvature_summary(log_path, prompt_tokens, records)
 
 
 def calculate_curvature(model, inputs, args):
@@ -185,7 +198,6 @@ def calculate_curvature(model, inputs, args):
 
 def calculate_or_reuse(args):
     output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
 
     # CPU curvature uses multiple processes, each with one Torch thread.
     torch.set_num_threads(1)
@@ -200,26 +212,31 @@ def calculate_or_reuse(args):
     if not 0 <= args.layer_start < args.layer_end <= config.num_hidden_layers:
         raise ValueError("Expected 0 <= layer-start < layer-end <= model layer count")
 
-    settings_path = output / "settings.json"
-    settings = vars(args) | {"neighbor_keep_quantile": _NEIGHBOR_KEEP_QUANTILE,
-                             "curvature_algorithm_version": CURVATURE_ALGORITHM_VERSION}
-    if settings_path.exists():
-        previous = json.loads(settings_path.read_text())
-        for key in ("model_path", "tokenizer_path", "task", "num_samples", "max_length", "dtype",
-                    "curvature_dtype", "alpha", "seed", "layer_start", "layer_end", "neighbor_keep_quantile",
-                    "curvature_algorithm_version", "last_k", "query_aggregation"):
-            if previous.get(key) != settings[key]:
-                raise ValueError(f"Cannot reuse curvature with changed {key}: {previous.get(key)} -> {settings[key]}. "
-                                 "Use a new output directory, or evaluate the existing scores with "
-                                 "kv_cache_experiment/evaluate_curvature.py --curvature-dir RUN_DIR.")
-    else:
-        if any(output.glob("layer_*/prompt_*.pt")):
-            raise ValueError("Saved curvature has no settings.json to verify reuse")
-
-    complete = args.save_curvature and settings_path.exists() and all(
-        (output / f"layer_{layer:03d}" / f"prompt_{prompt:05d}.pt").is_file()
-        for layer in range(args.layer_start, args.layer_end) for prompt in range(previous["prompt_count"])
-    )
+    outputs = curvature_output_dirs(args)
+    complete = bool(args.save_curvature)
+    for mode, directory in outputs.items():
+        directory.mkdir(parents=True, exist_ok=True)
+        settings_path = directory / "settings.json"
+        settings = vars(args) | {"neighbor_keep_quantile": _NEIGHBOR_KEEP_QUANTILE,
+                                 "curvature_algorithm_version": CURVATURE_ALGORITHM_VERSION,
+                                 "query_aggregation": mode, "output_dir": str(directory)}
+        if settings_path.exists():
+            previous = json.loads(settings_path.read_text())
+            for key in ("model_path", "tokenizer_path", "task", "num_samples", "max_length", "dtype",
+                        "curvature_dtype", "alpha", "seed", "layer_start", "layer_end", "neighbor_keep_quantile",
+                        "curvature_algorithm_version", "last_k", "query_aggregation"):
+                if previous.get(key) != settings[key]:
+                    raise ValueError(f"Cannot reuse curvature with changed {key}: {previous.get(key)} -> {settings[key]}. "
+                                     "Use a new output directory, or evaluate the existing scores with "
+                                     "kv_cache_experiment/evaluate_curvature.py --curvature-dir RUN_DIR.")
+            complete = complete and all(
+                (directory / f"layer_{layer:03d}" / f"prompt_{prompt:05d}.pt").is_file()
+                for layer in range(args.layer_start, args.layer_end) for prompt in range(previous["prompt_count"])
+            )
+        else:
+            if any(directory.glob("layer_*/prompt_*.pt")):
+                raise ValueError("Saved curvature has no settings.json to verify reuse")
+            complete = False
     if complete:
         print(f"All curvature files already exist in {output}; skipping calculation.", flush=True)
         return output
@@ -229,21 +246,7 @@ def calculate_or_reuse(args):
     prompts = load_dataset(args)
 
     # 2. Capture initial hidden states; later layers collect their values on demand.
-    token_ids = []
-    inputs = capture_layer_inputs(model, tokenizer, prompts, args.max_length, prompt_token_ids=token_ids)
-    manifest = {"input_ids": token_ids,
-                "prompt_sha256": [hashlib.sha256(text.encode()).hexdigest() for text in prompts]}
-    manifest_path = output / "prompts.pt"
-    if manifest_path.exists():
-        saved_manifest = torch.load(manifest_path, map_location="cpu", weights_only=True)
-        if saved_manifest["prompt_sha256"] != manifest["prompt_sha256"] or any(
-            not torch.equal(old, new) for old, new in zip(saved_manifest["input_ids"], token_ids)
-        ):
-            raise ValueError("Prompt content or tokenization changed since the saved curvature run")
-        del saved_manifest
-    elif args.save_curvature:
-        torch.save(manifest, manifest_path)
-    del manifest, token_ids
+    inputs = capture_layer_inputs(model, tokenizer, prompts, args.max_length)
     del prompts, tokenizer
 
     settings = vars(args) | {
@@ -256,8 +259,11 @@ def calculate_or_reuse(args):
         "attention_edge_definition": "head_feature_sets_with_shortest_boundary_distances",
         "curvature_ranking_order": "descending",
     }
-    if not settings_path.exists():
-        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    for mode, directory in outputs.items():
+        settings_path = directory / "settings.json"
+        if not settings_path.exists():
+            saved_settings = settings | {"query_aggregation": mode, "output_dir": str(directory)}
+            settings_path.write_text(json.dumps(saved_settings, indent=2) + "\n")
 
     # 3. Collect each layer's values, calculate curvature, and save the scores.
     calculate_curvature(model, inputs, args)
@@ -276,13 +282,18 @@ def main():
                      score_source=args.score_source, curvature_reduction=args.curvature_reduction,
                      curvature_ranking=args.curvature_ranking)
         return
-    output = calculate_or_reuse(args)
+    calculate_or_reuse(args)
     if args.evaluate:
         from kv_cache_experiment.evaluate_curvature import evaluate_run
-        evaluate_run(output, methods=args.presses, compression_ratios=args.compression_ratios,
-                     device=args.device, max_new_tokens=args.max_new_tokens,
-                     output_dir=args.evaluation_output_dir, score_source=args.score_source,
-                     curvature_reduction=args.curvature_reduction, curvature_ranking=args.curvature_ranking)
+        outputs = curvature_output_dirs(args)
+        for mode, output in outputs.items():
+            evaluation = args.evaluation_output_dir
+            if evaluation is not None and len(outputs) > 1:
+                evaluation = str(Path(evaluation) / mode)
+            evaluate_run(output, methods=args.presses, compression_ratios=args.compression_ratios,
+                         device=args.device, max_new_tokens=args.max_new_tokens,
+                         output_dir=evaluation, score_source=args.score_source,
+                         curvature_reduction=args.curvature_reduction, curvature_ranking=args.curvature_ranking)
 
 
 if __name__ == "__main__":

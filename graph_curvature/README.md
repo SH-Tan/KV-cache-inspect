@@ -2,7 +2,7 @@
 
 Compute one final curvature per head and key token along `layer_input -> v_proj -> Att_out -> o_proj`, using the last `min(k, prompt_length)` query rows. Every prompt and every key token keeps its own score. Saved per-head rankings sort **raw curvature descending**; compression instead keeps **more negative curvature**. Scores are never minimized across tokens or prompts.
 
-`run.sh` defaults to `LAST_K=32 QUERY_AGGREGATION=attention_mean`, calculating and saving fresh scores (`RUN_CALCULATION=1 SAVE_CURVATURE=1 EVALUATE=0`). The Python CLI defaults to `--last-k 1` for existing callers. Set `LAST_K=1` to reproduce last-row calculation.
+`run.sh` defaults to `LAST_K=32 QUERY_AGGREGATION=curvature_both`, calculating and saving fresh scores (`RUN_CALCULATION=1 SAVE_CURVATURE=1 EVALUATE=0`). The Python CLI defaults to `--last-k 1 --query-aggregation attention_mean` for existing callers. Set `LAST_K=1` to use only the last row.
 
 | `QUERY_AGGREGATION` / `--query-aggregation` | Calculation |
 | --- | --- |
@@ -10,12 +10,23 @@ Compute one final curvature per head and key token along `layer_input -> v_proj 
 | `attention_max` | Take the maximum selected A value per head/token, then calculate curvature |
 | `curvature_mean` | Calculate each selected row's curvature, then average finite results per head/token |
 | `curvature_min` | Calculate each selected row's curvature, then take the minimum finite result per head/token |
+| `curvature_both` | Calculate each selected row's curvature once, accumulating both finite mean and minimum; save in separate folders |
 
-`attention_mean` divides each head/token's selected attention sum by its number of nonzero entries, excluding both causal zeros and other exact zeros. For example, `[0, 0, 0.6, 0.8]` becomes `0.7`; all-zero entries remain zero. Attention-first modes do not renormalize the reduced A values and use the final query's `o_proj` output neighbors. Curvature-first modes use each row's matching `o_proj` output and exclude future key positions from the reduction. A real zero attention on a visible position retains curvature `1`; undefined results are excluded, and an all-undefined token remains `NaN`. Rows are processed individually without retaining a tensor of all per-row curvatures. Query aggregation is separate from `CURVATURE_REDUCTION`, which reduces heads during evaluation.
+`attention_mean` divides each head/token's selected attention sum by its number of nonzero entries, excluding both causal zeros and other exact zeros. For example, `[0, 0, 0.6, 0.8]` becomes `0.7`; all-zero entries remain zero. Attention-first modes do not renormalize the reduced A values and use the final query's `o_proj` output neighbors. Curvature-first modes use each row's matching `o_proj` output and exclude future key positions from the reduction. Zero-attention entries are absent edges: no OT is run for them, and their curvature remains `NaN`. Mean/min exclude these entries and other undefined results; a token with no finite contribution remains `NaN`. Rows are processed individually without retaining a tensor of all per-row curvatures. Query aggregation is separate from `CURVATURE_REDUCTION`, which reduces heads during evaluation.
 
 ```bash
-LAST_K=32 QUERY_AGGREGATION=attention_mean bash graph_curvature/run.sh
-# Alternatives: attention_max, curvature_mean, curvature_min.
+LAST_K=32 QUERY_AGGREGATION=curvature_both bash graph_curvature/run.sh
+# Alternatives: attention_mean, attention_max, curvature_mean, curvature_min.
+```
+
+For `curvature_both`, each dataset output contains `curvature_min/` and `curvature_mean/`, each with its own `settings.json`, `layer_NNN/prompt_NNNNN.pt`, and analysis summaries. The model forward pass and per-row OT solves are shared; only running min, sum, and count tensors of shape `[heads, tokens]` are retained. Resume checks both folders and reuses completed files independently. `EVALUATE=1` evaluates both folders separately; the standalone evaluator can take either folder as `--curvature-dir`. Online compression requires a single aggregation mode.
+
+Each folder saves `curvature_scores["A"]` with the same `[query_heads, key_tokens]` shape as the other modes. For head `h` and key token `t`, it contains the minimum or mean of finite curvatures of nonzero `A[h, selected_query, t]` edges. Heads and tokens are never combined during this query reduction. For evaluation, choose that saved query reduction through `CURVATURE_DIR`; `PRESSES=curvature_min,curvature_mean,...` still selects the independent reduction **across heads**, as before:
+
+```bash
+CURVATURE_DIR=logs/graph_curvature/my_run/longbench_lcc/curvature_min \
+PRESSES=curvature_min,curvature_mean bash graph_curvature/run_eval.sh
+# Set CURVATURE_DIR to the sibling curvature_mean folder to evaluate query means.
 ```
 
 The selected k, aggregation mode, and algorithm version are checked on resume. Use a different `OUTPUT_DIR` for each setting combination.
@@ -40,13 +51,13 @@ PYTHON_BIN=python MODEL_PATH="<model-id-or-path>" bash graph_curvature/run.sh
 | --- | --- | --- |
 | `RUN_CALCULATION` | Calculate or resume offline curvature (`1`), or skip that stage (`0`); offline launcher only | `1` |
 | `EVALUATE` | Run compression and accuracy comparison (`1`), or skip it (`0`) | Offline: `0` |
-| `TASKS` | Comma-separated datasets, processed sequentially; `TASK` still selects one dataset | Offline: `longbench_lcc,longbench_qasper` |
-| `SAVE_CURVATURE` | Write curvature `.pt` files and prompt-token manifest (`1`), or keep curvature transient (`0`) | Offline: `1`; online: `0` |
+| `TASKS` | Comma-separated datasets, processed sequentially; `TASK` still selects one dataset | Offline: `longbench_lcc,longbench_trec` |
+| `SAVE_CURVATURE` | Write curvature `.pt` files (`1`), or keep curvature transient (`0`) | Offline: `1`; online: `0` |
 | `SCORE_SOURCE` | Use original method scores (`native`), or curvature scoring for SnapKV/PyramidKV/ExpectedAttention (`curvature`) | `curvature` |
 | `CURVATURE_REDUCTION` | Reduce query heads with `min` or `mean` for those three variants; direct curvature methods retain their named reduction | `min` |
 | `CURVATURE_RANKING` | Rank direct curvature scores per `layer`, or across the full `model` | `layer` |
 | `OUTPUT_DIR` | Run root; multiple datasets get separate `OUTPUT_DIR/<task>` directories | New timestamped directory |
-| `CURVATURE_DIR` | Saved run directory used for comparison; contains `settings.json` and layer `.pt` files | `OUTPUT_DIR` |
+| `CURVATURE_DIR` | Saved score folder, or paired-output root when using `run.sh`; `run_eval.sh` takes one score folder | `OUTPUT_DIR` |
 | `EVALUATION_OUTPUT_DIR` | Optional evaluation root; multiple datasets get separate `<task>` subdirectories | Each task's run directory plus `/evaluation` |
 
 The offline launcher defaults to 100 samples per task. Complete rendered prompts measured with the cached Granite 3.3 2B tokenizer (no truncation) have these mean token lengths:
@@ -62,9 +73,9 @@ These are shorter cached options than HotpotQA (16,276 tokens on average); indiv
 Offline calculation and comparison run in separate processes to release calculation memory before inference. By default, `run.sh` calculates and saves a fresh run; set `EVALUATE=1` to evaluate afterward. Use the same `OUTPUT_DIR` and settings to resume it. A complete score set skips loading the calculation model. Partial runs still propagate hidden states through the layers, but skip OT and projection-cost construction wherever scores already exist. Calculation settings, neighbor quantile, and algorithm version must match the saved run.
 
 ```bash
-RUN_CALCULATION=1 OUTPUT_DIR=logs/graph_curvature/my_last32_mean_run NUM_SAMPLES=50 bash graph_curvature/run.sh
+RUN_CALCULATION=1 OUTPUT_DIR=logs/graph_curvature/my_last32_run NUM_SAMPLES=50 bash graph_curvature/run.sh
 # Resume the same calculation and evaluate on exactly those prompts:
-RUN_CALCULATION=1 OUTPUT_DIR=logs/graph_curvature/my_last32_mean_run NUM_SAMPLES=50 bash graph_curvature/run.sh
+RUN_CALCULATION=1 EVALUATE=1 OUTPUT_DIR=logs/graph_curvature/my_last32_run NUM_SAMPLES=50 bash graph_curvature/run.sh
 ```
 
 To compare an existing score directory using the shell controls:
@@ -78,7 +89,7 @@ RUN_CALCULATION=1 EVALUATE=0 OUTPUT_DIR=logs/graph_curvature/my_last32_mean_run 
 bash graph_curvature/run.sh
 ```
 
-That legacy run contains **0.9-quantile, algorithm-version-1** curvature. New calculations use **0.70, version 6**. Version 6 excludes zero attention values from query means. Comparison-only mode can evaluate older runs and records their original quantile/version. Resuming calculation requires matching versions so corrected OT results are not mixed with older files.
+That legacy run contains **0.9-quantile, algorithm-version-1** curvature. New calculations use **0.70, version 7**. Version 7 leaves zero-attention curvature undefined and supports shared mean/min calculation. Comparison-only mode can evaluate older runs and records their original quantile/version. Resuming calculation requires matching versions so corrected OT results are not mixed with older files.
 
 The launcher comparison is an uncompressed baseline plus `curvature_min`, `curvature_second_min`, `curvature_mean`, `SnapKVPress`, `ExpectedAttentionPress`, and `PyramidKVPress`, at removal ratios `0.3,0.5,0.7,0.9`. Configure `PRESSES`, `COMPRESSION_RATIOS`, and optional `MAX_NEW_TOKENS` in the launcher, or `--methods`, `--compression-ratios`, and `--max-new-tokens` in the standalone evaluator. Generation is greedy, with the saved seed and the task's generation cap unless overridden.
 
@@ -111,7 +122,7 @@ bash graph_curvature/run_eval.sh
 
 Full-model ranking retains only one CPU score per layer/token while ranking. Saved-score evaluation builds the selection before compressing the first layer and still compresses caches as each layer finishes. Online evaluation computes each layer's curvature once, waits for the final layer's scores, then compresses all caches before decoding; its peak prefill memory therefore includes the full uncompressed KV cache. It does not copy full caches or retain full-model curvature operations. Generated tokens remain uncompressed in both modes.
 
-Every method uses the same first N task documents and exact prompt token IDs. New runs save one `prompts.pt` containing input IDs and prompt-text hashes. Legacy runs reconstruct tokenization from their saved task/settings and check token counts; exact identity assumes the cached dataset and tokenizer are unchanged. Prompts are never silently truncated for evaluation: the saved prompt plus generation must fit the model context.
+Every method uses the same first N task documents. New runs do not save `prompts.pt`; evaluation reconstructs tokenization from the recorded task/settings and checks token counts. Exact identity assumes the cached dataset and tokenizer are unchanged. Existing runs that contain `prompts.pt` can still use their saved token IDs and prompt-text hashes. Prompts are never silently truncated for evaluation: the prompt plus generation must fit the model context.
 
 Compression happens once after prefill. All methods retain exactly the same **total number of KV elements** at a given rate; the evaluator verifies the physical cache. PyramidKV keeps its varying, nonincreasing layer allocation, with integer rounding adjusted to match that total. SnapKV and PyramidKV reconstruct window attention using the model's actual attention scale, including Granite's configured multiplier. Generated tokens subsequently grow the cache normally.
 
@@ -193,13 +204,15 @@ Each file contains:
 | `curvature_ranking` | Key-token indices per head, highest curvature first |
 | `metrics` | Per-prompt cost, neighbor, and curvature summaries, reused on resume |
 
-Visible zero attention connections have curvature `1`. Nonfinite attention, nonfinite reciprocal costs for nonzero attention, and unsuccessful OT solves have `NaN` curvature. Invalid attention edges are excluded from shortest paths, so they cannot contaminate another head's finite route. Undefined final scores are excluded from ranking and appear as `-1` at the end of the ranking row. Equal finite curvatures preserve key-token order. Ranking is by curvature itself; raw attention rows are also saved.
+Zero attention connections have no curvature (`NaN`) and are skipped by OT. Nonfinite attention, nonfinite reciprocal costs for nonzero attention, and unsuccessful OT solves also have `NaN` curvature. Invalid attention edges are excluded from shortest paths, so they cannot contaminate another head's finite route. Undefined final scores are excluded from ranking and appear as `-1` at the end of the ranking row. Equal finite curvatures preserve key-token order. Ranking is by curvature itself; raw attention rows are also saved.
 
 每个文件保存一个 layer、一个 prompt 的聚合 A、对应曲率和 token 排序，形状为 `[query_heads, key_tokens]`，并保存选中的原始 A 行。无有效曲率时为 `NaN`，排序末尾以 `-1` 标记；相同曲率按 token 原顺序排列。
 
 `analysis/layer_NNN_A_summary.txt` keeps separate curvature summaries for every prompt. Its overall section pools cost means, neighbor counts, and score counts only; it does not reduce prompt score tensors. `prev`, `cur`, and `next` cost means refer to V projection, A coefficients, and O projection respectively. Neighbor counts exclude center nodes. `total_edges` counts final head/token scores; in curvature-first modes, `edge_evaluations` counts evaluated finite A edges across the selected rows.
 
 ## Validation / 验证
+
+Version 7 passed 24 small real-OT fixtures covering single and paired curvature reductions, attention-first modes, k=1/3/6, float32/float64 curvature, float32/bfloat16 attention, and MHA/GQA. Paired outputs matched explicit finite-only reductions of individually calculated rows, with one row solve per selected query. Additional checks covered all-zero attention without token tasks, multiprocessing parity, separate saved settings/manifests/rankings, complete and partial resume, version-6 rejection, and shell routing for paired/single runs and evaluation outputs. A final tiny two-layer Granite CPU integration checked real collection/OT/saving, per-head tensor shapes, all three direct evaluation scorers, curvature-variant loading, partial resume, k capped to prompt length, zero-edge exclusion, and unchanged model weights. No full dataset accuracy run was performed.
 
 Version 6's nonzero-only attention mean passed 30 direct cases covering causal zeros, genuine zeros, all-zero tokens, k=1/3/32, and float32/float64/bfloat16 inputs. Curvature matched an explicitly reduced attention graph, saved scores matched the reduction, and native online/offline prefill agreed for k=1/3/32. Resuming version-5 results was rejected; temporary outputs were removed.
 

@@ -21,7 +21,7 @@ from .curv_tensor_utils import _get_matrix_torch, adaptive_chunksize
 
 # Fork workers inherit these read-only CPU arrays for one prompt.
 _WORKER_STATE = None
-CURVATURE_ALGORITHM_VERSION = 6
+CURVATURE_ALGORITHM_VERSION = 7
 
 
 def _transport_cost(mu, nu, cost):
@@ -158,11 +158,6 @@ def _compute_a_curvature(
                     in_neighbors += in_count
                     out_neighbors += out_count
 
-        # Exact-zero attention has infinite cost and is excluded from valid_heads.
-        # Apply its prescribed curvature after collecting worker results.
-        zero_attention = (operations['A'][0, :, 0].detach() == 0).cpu().numpy()
-        curvature[zero_attention] = 1.0
-
         metrics = {
             'costs': {
                 'prev': finite_cost_statistics(prev_cpu),
@@ -185,23 +180,29 @@ def compute_a_curvature(operations, layer_cache, alpha=0.0, device='cpu', worker
     Attention mean excludes zeros (all-zero tokens stay zero); max takes the
     selected maximum. Both use the final query's output neighbors without
     renormalizing the reduced scores. Curvature mean/min uses
-    each row's own output neighbors and only its causally visible key tokens.
+    each row's own output neighbors and only its nonzero attention edges.
     Undefined curvatures are omitted; no finite contribution leaves NaN.
+    curvature_both returns a dict of mean/min tensors from the same row solves.
     Rows are processed one at a time with O(heads * tokens) reduction storage.
     """
-    if query_aggregation not in ('attention_mean', 'attention_max', 'curvature_mean', 'curvature_min'):
+    if query_aggregation not in ('attention_mean', 'attention_max', 'curvature_mean', 'curvature_min',
+                                 'curvature_both'):
         raise ValueError(f"Unknown query aggregation: {query_aggregation}")
     rows = operations['A'].shape[-2]
     length = operations['A'].shape[-1]
+    reductions = (('curvature_min', 'curvature_mean') if query_aggregation == 'curvature_both'
+                  else (query_aggregation,))
     if query_aggregation.startswith('attention_') or rows == 1:
         selected = dict(operations)
         selected['A'] = aggregate_attention_rows(operations['A'], query_aggregation).unsqueeze(-2)
         curvature, metrics = _compute_a_curvature(selected, layer_cache, alpha, device, workers)
+        if query_aggregation == 'curvature_both':
+            curvature = {mode: curvature for mode in reductions}
     else:
-        curvature = torch.full((operations['A'].shape[1], length),
-                               torch.inf if query_aggregation == 'curvature_min' else 0.0,
-                               dtype=curvature_torch_dtype())
-        counts = torch.zeros(curvature.shape, dtype=torch.int32)
+        shape = (operations['A'].shape[1], length)
+        curvatures = {mode: torch.full(shape, torch.inf if mode == 'curvature_min' else 0.0,
+                                      dtype=curvature_torch_dtype()) for mode in reductions}
+        counts = torch.zeros(shape, dtype=torch.int32)
         metrics = None
         for row in range(rows):
             stop = length - rows + row + 1
@@ -211,11 +212,12 @@ def compute_a_curvature(operations, layer_cache, alpha=0.0, device='cpu', worker
             selected['o_proj'] = operations['o_proj'][:, row:row + 1]
             scores, row_metrics = _compute_a_curvature(selected, layer_cache, alpha, device, workers)
             finite = torch.isfinite(scores)
-            target = curvature[:, :stop]
-            if query_aggregation == 'curvature_min':
-                torch.minimum(target, scores.masked_fill(~finite, torch.inf), out=target)
-            else:
-                target.add_(scores.masked_fill(~finite, 0.0))
+            for mode, curvature in curvatures.items():
+                target = curvature[:, :stop]
+                if mode == 'curvature_min':
+                    torch.minimum(target, scores.masked_fill(~finite, torch.inf), out=target)
+                else:
+                    target.add_(scores.masked_fill(~finite, 0.0))
             counts[:, :stop].add_(finite)
             if metrics is None:
                 metrics = row_metrics
@@ -224,9 +226,11 @@ def compute_a_curvature(operations, layer_cache, alpha=0.0, device='cpu', worker
                     metrics[key] += row_metrics[key]
                 for key in ('sum', 'count'):
                     metrics['costs']['cur'][key] += row_metrics['costs']['cur'][key]
-        if query_aggregation == 'curvature_mean':
-            curvature.div_(counts.clamp_min(1))
-        curvature.masked_fill_(counts == 0, torch.nan)
+        for mode, curvature in curvatures.items():
+            if mode == 'curvature_mean':
+                curvature.div_(counts.clamp_min(1))
+            curvature.masked_fill_(counts == 0, torch.nan)
+        curvature = curvatures if query_aggregation == 'curvature_both' else curvatures[query_aggregation]
     metrics['query_count'] = rows
     metrics['query_aggregation'] = query_aggregation
     return curvature, metrics

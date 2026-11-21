@@ -39,7 +39,7 @@ def load_prompt_tokens(run_dir, settings, task, tokenizer, online=False):
             raise ValueError("Task prompts differ from those used to calculate curvature")
         tokens, identity = manifest["input_ids"], "saved_input_ids_and_text_hashes"
     else:
-        # Legacy runs did not save token IDs. Reconstruct from their recorded settings.
+        # Reconstruct token IDs from the recorded task and tokenization settings.
         tokens = [tokenizer(text, return_tensors="pt", truncation=settings["max_length"] is not None,
                             max_length=settings["max_length"])["input_ids"][0] for text in prompts]
         identity = "online_tokenized_input_ids" if online else "legacy_reconstructed_from_task_and_run_settings"
@@ -170,10 +170,6 @@ def evaluate_run(curvature_dir, methods=DEFAULT_METHODS, compression_ratios=DEFA
                         total_token_length=sum(ids.numel() for ids in tokens), resolved_model_dtype=str(model.dtype))
         run_dir.mkdir(parents=True, exist_ok=True)
         write_json(run_dir / "settings.json", settings)
-        if settings["save_curvature"]:
-            torch.save({"input_ids": tokens,
-                        "prompt_sha256": [hashlib.sha256(text.encode()).hexdigest() for text in prompts]},
-                       run_dir / "prompts.pt")
     lm = CurvatureComparisonLM(model, tokenizer, prompts, tokens, settings["seed"])
     if online:
         lm.curvature_provider = OnlineCurvature(model, settings, run_dir)

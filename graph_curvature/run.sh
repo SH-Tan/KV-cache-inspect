@@ -16,15 +16,15 @@ COMPUTE_DEVICE="${COMPUTE_DEVICE:-cpu}"
 DTYPE="${DTYPE:-auto}"
 CURVATURE_DTYPE="${CURVATURE_DTYPE:-float32}"
 # TASK still selects one dataset; TASKS selects a comma-separated list.
-TASKS="${TASKS:-${TASK:-longbench_lcc,longbench_qasper}}"
+TASKS="${TASKS:-${TASK:-longbench_lcc,longbench_trec}}"
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 MAX_LENGTH="${MAX_LENGTH:-}"
 LAYER_START="${LAYER_START:-0}"
 LAYER_END="${LAYER_END:-}"
 ALPHA="${ALPHA:-0.5}"
-LAST_K="${LAST_K:-32}"
-# attention_mean/attention_max: reduce A first; curvature_mean/curvature_min: curvature first.
-QUERY_AGGREGATION="${QUERY_AGGREGATION:-attention_mean}"
+LAST_K="${LAST_K:-16}"
+# attention_mean/attention_max: reduce A first; curvature_both saves mean/min from one pass.
+QUERY_AGGREGATION="${QUERY_AGGREGATION:-curvature_both}"
 # This A40 host has 48 physical cores / 96 logical CPUs.
 WORKERS="${WORKERS:-48}"
 SEED="${SEED:-29}"
@@ -88,6 +88,17 @@ IFS=',' read -r -a task_names <<< "${TASKS// /}"
 
 run_evaluation() {
   local curvature_dir="$1" output="$2"
+  if [ -f "$curvature_dir/curvature_min/settings.json" ] && [ -f "$curvature_dir/curvature_mean/settings.json" ]; then
+    local aggregation paired_output
+    for aggregation in curvature_min curvature_mean; do
+      paired_output="$output"
+      if [ -n "$paired_output" ]; then
+        paired_output="$paired_output/$aggregation"
+      fi
+      run_evaluation "$curvature_dir/$aggregation" "$paired_output"
+    done
+    return
+  fi
   local output_flags=()
   if [ -n "$output" ]; then
     output_flags+=(--output-dir "$output")
@@ -105,7 +116,7 @@ if [ "$RUN_CALCULATION:$EVALUATE:$SAVE_CURVATURE" = 1:1:0 ]; then
   exit 2
 fi
 
-if [ "$RUN_CALCULATION" = 0 ] && [ -f "$CURVATURE_DIR/settings.json" ]; then
+if [ "$RUN_CALCULATION" = 0 ] && { [ -f "$CURVATURE_DIR/settings.json" ] || [ -f "$CURVATURE_DIR/curvature_min/settings.json" ]; }; then
   if [ "$EVALUATE" = 1 ]; then
     run_evaluation "$CURVATURE_DIR" "$EVALUATION_OUTPUT_DIR"
   fi
