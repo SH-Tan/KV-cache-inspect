@@ -3,7 +3,7 @@ import torch
 
 from graph_curvature.curvature_utils.curv_dtype_utils import curvature_np_dtype, curvature_torch_dtype
 
-_NEIGHBOR_KEEP_QUANTILE = 0.7
+_NEIGHBOR_KEEP_QUANTILE = 0.85
 
 
 def minmax_per_batch_nonzero_nozero(x, eps=1e-4, dim=-1):

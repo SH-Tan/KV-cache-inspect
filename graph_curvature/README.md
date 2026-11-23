@@ -2,7 +2,7 @@
 
 Compute one final curvature per head and key token along `layer_input -> v_proj -> Att_out -> o_proj`, using the last `min(k, prompt_length)` query rows. Every prompt and every key token keeps its own score. Saved per-head rankings sort **raw curvature descending**; compression instead keeps **more negative curvature**. Scores are never minimized across tokens or prompts.
 
-`run.sh` defaults to `LAST_K=32 QUERY_AGGREGATION=curvature_both`, calculating and saving fresh scores (`RUN_CALCULATION=1 SAVE_CURVATURE=1 EVALUATE=0`). The Python CLI defaults to `--last-k 1 --query-aggregation attention_mean` for existing callers. Set `LAST_K=1` to use only the last row.
+`run.sh` defaults to `LAST_K=1 QUERY_AGGREGATION=attention_mean`, using each head's original final A row unchanged and calculating and saving fresh scores (`RUN_CALCULATION=1 SAVE_CURVATURE=1 EVALUATE=0`). With one selected row, `attention_mean` passes it through without averaging across queries or heads. The Python CLI has the same row-selection defaults.
 
 | `QUERY_AGGREGATION` / `--query-aggregation` | Calculation |
 | --- | --- |
@@ -60,7 +60,7 @@ PYTHON_BIN=python MODEL_PATH="<model-id-or-path>" bash graph_curvature/run.sh
 | `CURVATURE_DIR` | Saved score folder, or paired-output root when using `run.sh`; `run_eval.sh` takes one score folder | `OUTPUT_DIR` |
 | `EVALUATION_OUTPUT_DIR` | Optional evaluation root; multiple datasets get separate `<task>` subdirectories | Each task's run directory plus `/evaluation` |
 
-The offline launcher defaults to 100 samples per task. Complete rendered prompts measured with the cached Granite 3.3 2B tokenizer (no truncation) have these mean token lengths:
+The offline launcher defaults to each task's complete LongBench test set: 500 prompts for LCC and RepoBench-P, 150 for MultiFieldQA-en, and 200 for the other tasks. Set `NUM_SAMPLES` to override the count for all selected tasks. Complete rendered prompts measured with the cached Granite 3.3 2B tokenizer (no truncation) have these mean token lengths:
 
 | Dataset | Full test set | First 50 prompts |
 | --- | ---: | ---: |

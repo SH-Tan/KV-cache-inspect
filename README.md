@@ -9,24 +9,26 @@ Tools for studying language-model behavior through KV-cache compression and grap
 
 [LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding](https://github.com/THUDM/LongBench/tree/main/LongBench) evaluates long-context understanding across six task categories. The table covers the 16 English/code tasks listed in this repository's KV-cache launcher. Task IDs in `lm_eval` use the prefix `longbench_` (for example, `longbench_qasper`).
 
-| Dataset ID | Full name / description | Category | Score metric |
-| --- | --- | --- | --- |
-| `narrativeqa` | NarrativeQA: questions about stories and scripts | Single-document QA | Token F1 |
-| `qasper` | Qasper: question answering over scientific papers | Single-document QA | Token F1 |
-| `multifieldqa_en` | MultiFieldQA (English): questions across diverse domains | Single-document QA | Token F1 |
-| `hotpotqa` | HotpotQA: questions requiring evidence from multiple documents | Multi-document QA | Token F1 |
-| `2wikimqa` | 2WikiMultihopQA: multi-hop questions over Wikipedia documents | Multi-document QA | Token F1 |
-| `musique` | MuSiQue: multi-hop questions composed from single-hop questions | Multi-document QA | Token F1 |
-| `gov_report` | GovReport: government report summarization | Summarization | ROUGE-L F1 |
-| `qmsum` | QMSum: query-based meeting summarization | Summarization | ROUGE-L F1 |
-| `multi_news` | MultiNews: multi-document news summarization | Summarization | ROUGE-L F1 |
-| `trec` | TREC (Text REtrieval Conference): question classification | Few-shot learning | Classification accuracy |
-| `triviaqa` | TriviaQA: trivia question answering with examples | Few-shot learning | Token F1 |
-| `samsum` | SAMSum: dialogue summarization with examples | Few-shot learning | ROUGE-L F1 |
-| `passage_count` | PassageCount: count distinct passages in repeated text | Synthetic tasks | Counting accuracy |
-| `passage_retrieval_en` | PassageRetrieval (English): identify the passage matching a summary | Synthetic tasks | Retrieval accuracy |
-| `lcc` | Long Code Completion: predict the next code line | Code completion | Edit similarity |
-| `repobench-p` | RepoBench-P: repository-level next-line code prediction | Code completion | Edit similarity |
+| Dataset ID | Full name / description | Category | Score metric | Total prompts | Average length (words) |
+| --- | --- | --- | --- | ---: | ---: |
+| `narrativeqa` | NarrativeQA: questions about stories and scripts | Single-document QA | Token F1 | 200 | 18,409 |
+| `qasper` | Qasper: question answering over scientific papers | Single-document QA | Token F1 | 200 | 3,619 |
+| `multifieldqa_en` | MultiFieldQA (English): questions across diverse domains | Single-document QA | Token F1 | 150 | 4,559 |
+| `hotpotqa` | HotpotQA: questions requiring evidence from multiple documents | Multi-document QA | Token F1 | 200 | 9,151 |
+| `2wikimqa` | 2WikiMultihopQA: multi-hop questions over Wikipedia documents | Multi-document QA | Token F1 | 200 | 4,887 |
+| `musique` | MuSiQue: multi-hop questions composed from single-hop questions | Multi-document QA | Token F1 | 200 | 11,214 |
+| `gov_report` | GovReport: government report summarization | Summarization | ROUGE-L F1 | 200 | 8,734 |
+| `qmsum` | QMSum: query-based meeting summarization | Summarization | ROUGE-L F1 | 200 | 10,614 |
+| `multi_news` | MultiNews: multi-document news summarization | Summarization | ROUGE-L F1 | 200 | 2,113 |
+| `trec` | TREC (Text REtrieval Conference): question classification | Few-shot learning | Classification accuracy | 200 | 5,177 |
+| `triviaqa` | TriviaQA: trivia question answering with examples | Few-shot learning | Token F1 | 200 | 8,209 |
+| `samsum` | SAMSum: dialogue summarization with examples | Few-shot learning | ROUGE-L F1 | 200 | 6,258 |
+| `passage_count` | PassageCount: count distinct passages in repeated text | Synthetic tasks | Counting accuracy | 200 | 11,141 |
+| `passage_retrieval_en` | PassageRetrieval (English): identify the passage matching a summary | Synthetic tasks | Retrieval accuracy | 200 | 9,289 |
+| `lcc` | Long Code Completion: predict the next code line | Code completion | Edit similarity | 500 | 1,235 |
+| `repobench-p` | RepoBench-P: repository-level next-line code prediction | Code completion | Edit similarity | 500 | 4,206 |
+
+Counts and average lengths come from the [official LongBench statistics](https://github.com/THUDM/LongBench/blob/main/LongBench/task.md#longbench-statistics) for the complete original test sets, before experiment sampling or truncation. English and code lengths use whitespace-separated words (`str.split()`); rendered prompt token lengths depend on the task template and model tokenizer.
 
 ### How the metrics are calculated
 

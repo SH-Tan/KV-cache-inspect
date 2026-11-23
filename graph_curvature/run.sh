@@ -16,15 +16,16 @@ COMPUTE_DEVICE="${COMPUTE_DEVICE:-cpu}"
 DTYPE="${DTYPE:-auto}"
 CURVATURE_DTYPE="${CURVATURE_DTYPE:-float32}"
 # TASK still selects one dataset; TASKS selects a comma-separated list.
-TASKS="${TASKS:-${TASK:-longbench_lcc,longbench_trec}}"
-NUM_SAMPLES="${NUM_SAMPLES:-100}"
+TASKS="${TASKS:-${TASK:-longbench_lcc,longbench_trec,longbench_qasper,longbench_multi_news}}"
+# Empty uses the complete LongBench test set for each task.
+NUM_SAMPLES="${NUM_SAMPLES:-}"
 MAX_LENGTH="${MAX_LENGTH:-}"
 LAYER_START="${LAYER_START:-0}"
 LAYER_END="${LAYER_END:-}"
-ALPHA="${ALPHA:-0.5}"
-LAST_K="${LAST_K:-16}"
-# attention_mean/attention_max: reduce A first; curvature_both saves mean/min from one pass.
-QUERY_AGGREGATION="${QUERY_AGGREGATION:-curvature_both}"
+ALPHA="${ALPHA:-0.9}"
+LAST_K="${LAST_K:-1}"
+# With LAST_K=1, attention_mean passes through each head's original final A row.
+QUERY_AGGREGATION="${QUERY_AGGREGATION:-attention_mean}"
 # This A40 host has 48 physical cores / 96 logical CPUs.
 WORKERS="${WORKERS:-48}"
 SEED="${SEED:-29}"
@@ -124,6 +125,11 @@ if [ "$RUN_CALCULATION" = 0 ] && { [ -f "$CURVATURE_DIR/settings.json" ] || [ -f
 fi
 
 for task in "${task_names[@]}"; do
+  case "$task" in
+    longbench_lcc|longbench_repobench-p) benchmark_samples=500 ;;
+    longbench_multifieldqa_en) benchmark_samples=150 ;;
+    *) benchmark_samples=200 ;;
+  esac
   output="$OUTPUT_DIR"
   curvature="$CURVATURE_DIR"
   evaluation="$EVALUATION_OUTPUT_DIR"
@@ -140,7 +146,7 @@ for task in "${task_names[@]}"; do
       --cache-dir "$CACHE_DIR" --output-dir "$output" \
       --device "$DEVICE" --compute-device "$COMPUTE_DEVICE" \
       --dtype "$DTYPE" --curvature-dtype "$CURVATURE_DTYPE" \
-      --task "$task" --num-samples "$NUM_SAMPLES" --layer-start "$LAYER_START" \
+      --task "$task" --num-samples "${NUM_SAMPLES:-$benchmark_samples}" --layer-start "$LAYER_START" \
       --alpha "$ALPHA" --workers "$WORKERS" --seed "$SEED" \
       --last-k "$LAST_K" --query-aggregation "$QUERY_AGGREGATION" \
       --save-curvature "$SAVE_CURVATURE" --score-source "$SCORE_SOURCE" \
